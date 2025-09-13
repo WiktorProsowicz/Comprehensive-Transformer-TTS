@@ -5,7 +5,7 @@ import numpy as np
 from scipy.io import wavfile
 from tqdm import tqdm
 
-from text import _clean_text
+from comp_trans_tts.text import _clean_text
 
 
 def prepare_align(config):

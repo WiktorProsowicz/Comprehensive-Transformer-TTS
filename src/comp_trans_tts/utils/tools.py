@@ -13,7 +13,7 @@ from scipy.interpolate import interp1d
 from matplotlib import pyplot as plt
 from sklearn.manifold import TSNE
 
-from utils.pitch_tools import denorm_f0, expand_f0_ph, cwt2f0
+from comp_trans_tts.utils.pitch_tools import denorm_f0, expand_f0_ph, cwt2f0
 
 
 def get_configs_of(dataset):

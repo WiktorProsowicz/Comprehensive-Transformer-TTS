@@ -7,18 +7,17 @@ import copy
 import tgt
 import librosa
 import numpy as np
-import pyworld as pw
 from scipy.stats import betabinom
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from pathlib import Path
 
 from g2p_en import G2p
-import audio as Audio
-from model import PreDefinedEmbedder
-from text import grapheme_to_phoneme
-from utils.pitch_tools import get_pitch, get_cont_lf0, get_lf0_cwt
-from utils.tools import get_phoneme_level_energy, plot_embedding, spec_f0_to_figure
+
+import comp_trans_tts.audio as Audio
+from comp_trans_tts.text import grapheme_to_phoneme
+from comp_trans_tts.utils.pitch_tools import get_pitch, get_cont_lf0, get_lf0_cwt
+from comp_trans_tts.utils.tools import get_phoneme_level_energy, plot_embedding
 
 
 class Preprocessor:

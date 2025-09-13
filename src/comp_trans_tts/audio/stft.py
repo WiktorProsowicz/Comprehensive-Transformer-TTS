@@ -7,12 +7,12 @@ from librosa.util import pad_center, tiny
 from librosa.filters import mel as librosa_mel_fn
 import pyloudnorm as pyln
 
-from audio.audio_processing import (
+from comp_trans_tts.audio.audio_processing import (
     dynamic_range_compression,
     dynamic_range_decompression,
     window_sumsquare,
 )
-from audio.tools import (
+from comp_trans_tts.audio.tools import (
     librosa_pad_lr,
     amp_to_db,
     normalize,

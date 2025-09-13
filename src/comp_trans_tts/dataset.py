@@ -5,9 +5,9 @@ import os
 import numpy as np
 from torch.utils.data import Dataset
 
-from text import text_to_sequence
-from utils.tools import get_variance_level, pad_1D, pad_2D, pad_3D
-from utils.pitch_tools import norm_interp_f0, get_lf0_cwt
+from comp_trans_tts.text import text_to_sequence
+from comp_trans_tts.utils.tools import get_variance_level, pad_1D, pad_2D, pad_3D
+from comp_trans_tts.utils.pitch_tools import norm_interp_f0, get_lf0_cwt
 
 
 class Dataset(Dataset):

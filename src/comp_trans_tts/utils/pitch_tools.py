@@ -4,7 +4,6 @@
 import librosa
 import parselmouth
 import numpy as np
-import pyworld as pw
 import torch
 import torch.nn.functional as F
 from pycwt import wavelet
