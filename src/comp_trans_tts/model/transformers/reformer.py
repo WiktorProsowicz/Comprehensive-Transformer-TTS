@@ -11,10 +11,10 @@ from functools import partial, reduce, wraps
 from local_attention import LocalAttention
 from product_key_memory import PKM
 
-from text.symbols import symbols
+from comp_trans_tts.text.symbols import symbols
 
-from .constants import PAD
-from .blocks import (
+from comp_trans_tts.model.transformers.constants import PAD
+from comp_trans_tts.model.transformers.blocks import (
     get_sinusoid_encoding_table,
     LinearNorm,
 )

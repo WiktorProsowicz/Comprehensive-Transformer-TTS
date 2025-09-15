@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from utils.tools import get_variance_level, ssim
-from text import sil_phonemes_ids
+from comp_trans_tts.utils.tools import get_variance_level, ssim
+from comp_trans_tts.text import sil_phonemes_ids
 
 
 class CompTransTTSLoss(nn.Module):

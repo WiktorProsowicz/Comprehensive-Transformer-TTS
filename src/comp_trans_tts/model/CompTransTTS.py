@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modules import PostNet, VarianceAdaptor
-from utils.tools import get_mask_from_lengths
+from comp_trans_tts.model.modules import PostNet, VarianceAdaptor
+from comp_trans_tts.utils.tools import get_mask_from_lengths
 
 
 class CompTransTTS(nn.Module):

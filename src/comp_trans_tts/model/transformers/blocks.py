@@ -4,7 +4,7 @@ import numpy as np
 from torch.nn import functional as F
 import math
 
-from utils.tools import make_positions
+from comp_trans_tts.utils.tools import make_positions
 
 
 def Embedding(num_embeddings, embedding_dim, padding_idx=None):

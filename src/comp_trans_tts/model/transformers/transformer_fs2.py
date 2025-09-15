@@ -4,13 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import (
+from comp_trans_tts.model.transformers.blocks import (
     Embedding,
     Linear,
     LayerNorm,
     SinusoidalPositionalEmbedding,
 )
-from text.symbols import symbols
+from comp_trans_tts.text.symbols import symbols
 
 
 class FFTBlocks(nn.Module):

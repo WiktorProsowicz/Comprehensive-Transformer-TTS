@@ -10,7 +10,7 @@ from numba import jit, prange
 import numpy as np
 import torch.nn.functional as F
 
-from utils.tools import (
+from comp_trans_tts.utils.tools import (
     get_variance_level,
     get_phoneme_level_pitch,
     get_phoneme_level_energy,
@@ -19,8 +19,8 @@ from utils.tools import (
     pad,
     dur_to_mel2ph,
 )
-from utils.pitch_tools import f0_to_coarse, denorm_f0, cwt2f0_norm
-from .transformers.blocks import (
+from comp_trans_tts.utils.pitch_tools import f0_to_coarse, denorm_f0, cwt2f0_norm
+from comp_trans_tts.model.transformers.blocks import (
     Embedding,
     SinusoidalPositionalEmbedding,
     LayerNorm,
@@ -29,8 +29,8 @@ from .transformers.blocks import (
     ConvBlock,
     ConvBlock2D,
 )
-from .transformers.transformer import ScaledDotProductAttention
-from .coordconv import CoordConv2d
+from comp_trans_tts.model.transformers.transformer import ScaledDotProductAttention
+from comp_trans_tts.model.coordconv import CoordConv2d
 
 
 @jit(nopython=True)

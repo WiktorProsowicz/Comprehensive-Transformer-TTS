@@ -6,10 +6,10 @@ from typing import Optional
 import numpy as np
 from torch.nn import functional as F
 
-from text.symbols import symbols
+from comp_trans_tts.text.symbols import symbols
 
-from .constants import PAD
-from .blocks import (
+from comp_trans_tts.model.transformers.constants import PAD
+from comp_trans_tts.model.transformers.blocks import (
     get_sinusoid_encoding_table,
     Swish,
     GLU,

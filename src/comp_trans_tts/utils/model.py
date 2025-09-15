@@ -4,8 +4,9 @@ import json
 import torch
 import numpy as np
 
-import hifigan
-from model import CompTransTTS, ScheduledOptim
+from comp_trans_tts import hifigan
+from comp_trans_tts.model import CompTransTTS
+from comp_trans_tts.model.optimizer import ScheduledOptim
 
 
 def get_model(args, configs, device, train=False):
