@@ -359,11 +359,12 @@ class Preprocessor:
 
         return out_unsup, out_sup
 
-    def load_audio(self, wav_path):
-        wav_raw, _ = librosa.load(wav_path, self.sampling_rate)
-        _, index = librosa.effects.trim(wav_raw, top_db=self.trim_top_db, frame_length=self.filter_length, hop_length=self.hop_length)
+    @staticmethod
+    def load_audio(wav_path, sr, trim_top_db, hop_length, filter_length):
+        wav_raw, _ = librosa.load(wav_path, sr=sr)
+        _, index = librosa.effects.trim(wav_raw, top_db=trim_top_db, frame_length=filter_length, hop_length=hop_length)
         wav = wav_raw[index[0]:index[1]]
-        duration = (index[1] - index[0]) / self.hop_length
+        duration = (index[1] - index[0]) / hop_length
         return wav_raw.astype(np.float32), wav.astype(np.float32), int(duration)
 
     def process_utterance(self, tg_path, speaker, basename, save_speaker_emb):
@@ -547,7 +548,8 @@ class Preprocessor:
                 spker_embed,
             )
 
-    def beta_binomial_prior_distribution(self, phoneme_count, mel_count, scaling_factor=1.0):
+    @staticmethod
+    def beta_binomial_prior_distribution(phoneme_count, mel_count, scaling_factor=1.0):
         P, M = phoneme_count, mel_count
         x = np.arange(0, P)
         mel_text_probs = []
