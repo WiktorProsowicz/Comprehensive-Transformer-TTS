@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 
 import gdown
 import onnxruntime
@@ -15,12 +16,19 @@ PRETRAINED_MODEL_URL = 'https://drive.google.com/uc?id=10R9dhgX6IJQ3Nf7D0UdlZpwq
 class DeepSpeakerEmbedder:
     """Produces embeddings using pre-trained DeepSpeaker model."""
 
-    def __init__(self, model_persist_dir='~/.cache/comp_trans_tts'):
+    def __init__(self, device: str, model_persist_dir='~/.cache/comp_trans_tts'):
         """Inits the speaker embedder.
 
         Args:
+            device: Device the model will be run on. Either 'cpu' or 'cuda'.
             model_persist_dir: Directory the model will be cached in.
         """
+
+        available_providers = onnxruntime.get_available_providers()
+        if device == 'cuda' and 'CUDAExecutionProvider' not in available_providers:
+            logging.critical(
+                "ONNX Runtime was not installed with CUDA support, cannot use 'cuda' device.")
+            sys.exit(1)
 
         model_persist_dir = os.path.expanduser(model_persist_dir)
         os.makedirs(model_persist_dir, exist_ok=True)
@@ -42,8 +50,15 @@ class DeepSpeakerEmbedder:
             except subprocess.CalledProcessError as proc_err:
                 logging.critical('Failed to download the phoneme alignments: %s', proc_err)
 
+        if device == 'cuda':
+            providers = ['CUDAExecutionProvider']
+
+        else:
+            providers = ['CPUExecutionProvider']
+
         self._onnx_session = onnxruntime.InferenceSession(
-            os.path.join(model_persist_dir, 'deepspeaker_pretrained_onnx', 'deepspeaker.onnx')
+            os.path.join(model_persist_dir, 'deepspeaker_pretrained_onnx', 'deepspeaker.onnx'),
+            providers=providers
         )
 
     def __call__(self, model_input: np.ndarray):
