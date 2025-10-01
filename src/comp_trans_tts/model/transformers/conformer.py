@@ -184,65 +184,74 @@ class ConformerBlock(nn.Module):
     """
     def __init__(
             self,
+            attention_module: nn.Module,
             encoder_dim: int = 512,
-            num_attention_heads: int = 8,
             feed_forward_expansion_factor: int = 4,
             conv_expansion_factor: int = 2,
             feed_forward_dropout_p: float = 0.1,
             attention_dropout_p: float = 0.1,
             conv_dropout_p: float = 0.1,
             conv_kernel_size: int = 31,
-            half_step_residual: bool = True,
-            position_enc: Tensor = None,
-            max_seq_len: int = 10000,
-    ):
+            half_step_residual: bool = True):
+        
         super(ConformerBlock, self).__init__()
         if half_step_residual:
             self.feed_forward_residual_factor = 0.5
         else:
             self.feed_forward_residual_factor = 1
 
-        self.sequential = nn.Sequential(
-            ResidualConnectionModule(
-                module=FeedForwardModule(
-                    encoder_dim=encoder_dim,
-                    expansion_factor=feed_forward_expansion_factor,
-                    dropout_p=feed_forward_dropout_p,
-                ),
-                module_factor=self.feed_forward_residual_factor,
+        self._ff1 = ResidualConnectionModule(
+            module=FeedForwardModule(
+                encoder_dim=encoder_dim,
+                expansion_factor=feed_forward_expansion_factor,
+                dropout_p=feed_forward_dropout_p,
             ),
-            ResidualConnectionModule(
-                module=MultiHeadedSelfAttentionModule(
-                    d_model=encoder_dim,
-                    num_heads=num_attention_heads,
-                    dropout_p=attention_dropout_p,
-                    position_enc=position_enc,
-                    max_seq_len=max_seq_len,
-                ),
-            ),
-            ResidualConnectionModule(
-                module=ConformerConvModule(
-                    in_channels=encoder_dim,
-                    kernel_size=conv_kernel_size,
-                    expansion_factor=conv_expansion_factor,
-                    dropout_p=conv_dropout_p,
-                ),
-            ),
-            ResidualConnectionModule(
-                module=FeedForwardModule(
-                    encoder_dim=encoder_dim,
-                    expansion_factor=feed_forward_expansion_factor,
-                    dropout_p=feed_forward_dropout_p,
-                ),
-                module_factor=self.feed_forward_residual_factor,
-            ),
-            nn.LayerNorm(encoder_dim),
+            module_factor=self.feed_forward_residual_factor,
         )
 
-    def forward(self, inputs: Tensor, mask: Tensor) -> Tensor:
-        output = self.sequential(inputs)
-        if mask is not None:
-            output = output.masked_fill(mask.unsqueeze(-1), 0)
+        self._att_norm = nn.LayerNorm(encoder_dim)
+        self._att = attention_module
+        self._att_drop = nn.Dropout(p=attention_dropout_p)
+
+        self._conv = ResidualConnectionModule(
+            module=ConformerConvModule(
+                in_channels=encoder_dim,
+                kernel_size=conv_kernel_size,
+                expansion_factor=conv_expansion_factor,
+                dropout_p=conv_dropout_p,
+            ),
+        )
+
+        self._ff2 = ResidualConnectionModule(
+            module=FeedForwardModule(
+                encoder_dim=encoder_dim,
+                expansion_factor=feed_forward_expansion_factor,
+                dropout_p=feed_forward_dropout_p,
+            ),
+            module_factor=self.feed_forward_residual_factor,
+        )
+        
+        self._norm = nn.LayerNorm(encoder_dim)
+        
+
+    def forward(self,
+                inputs: Tensor,
+                query_mask: torch.Tensor,
+                key_mask: torch.Tensor) -> Tensor:
+        
+        output = self._ff1(inputs)
+        output = self._att_norm(output)
+        output = self._att(queries=output,
+                           keys=output,
+                           values=output,
+                           query_mask=query_mask,
+                           key_mask=key_mask)
+
+        output = self._att_drop(output)
+        output = self._conv(output)
+        output = self._ff2(output)
+        output = self._norm(output)
+        
         return output
 
 
