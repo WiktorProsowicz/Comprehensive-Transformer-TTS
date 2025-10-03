@@ -236,16 +236,15 @@ class ConformerBlock(nn.Module):
 
     def forward(self,
                 inputs: Tensor,
-                query_mask: torch.Tensor,
-                key_mask: torch.Tensor) -> Tensor:
+                input_mask: Tensor) -> Tensor:
         
         output = self._ff1(inputs)
         output = self._att_norm(output)
         output = self._att(queries=output,
                            keys=output,
                            values=output,
-                           query_mask=query_mask,
-                           key_mask=key_mask)
+                           query_mask=input_mask,
+                           key_mask=input_mask)
 
         output = self._att_drop(output)
         output = self._conv(output)
