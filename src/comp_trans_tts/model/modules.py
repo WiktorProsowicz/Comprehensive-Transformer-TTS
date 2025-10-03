@@ -3,6 +3,7 @@ import json
 import copy
 import math
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -724,141 +725,82 @@ class NonParallelProsodyPredictor(nn.Module):
 
 
 class VarianceAdaptor(nn.Module):
-    """ Variance Adaptor """
+    """Variance Adaptor.
+    
+    The implementation has been reworked and supports the following setup:
+        - Unsupervised alignment learning.
+        - Explicit utterance-level prosody modelling (pitch and energy quantized into bins).
+    """
 
-    def __init__(self, preprocess_config, model_config, train_config, d_model):
-        super(VarianceAdaptor, self).__init__()
-        self.preprocess_config = preprocess_config
-        self.learn_alignment = model_config["duration_modeling"]["learn_alignment"]
-        self.binarization_start_steps = train_config["duration"]["binarization_start_steps"]
+    def __init__(self,
+                 d_model: int,
+                 n_mel_channels: int,
+                 aligner_temperature: float,
+                 multi_speaker: bool,
+                 predictor_n_layers: int,
+                 predictor_n_int_channels: int,
+                 predictor_kernel_size: int,
+                 dropout_rate: float):
+        
+        super().__init__()
 
-        self.use_pitch_embed = model_config["variance_embedding"]["use_pitch_embed"]
-        self.use_energy_embed = model_config["variance_embedding"]["use_energy_embed"]
-        self.predictor_grad = model_config["variance_predictor"]["predictor_grad"]
+        self._multi_speaker = multi_speaker
 
-        self.hidden_size = model_config["transformer"]["encoder_hidden"]
-        self.filter_size = model_config["variance_predictor"]["filter_size"]
-        self.predictor_layers = model_config["variance_predictor"]["predictor_layers"]
-        self.dropout = model_config["variance_predictor"]["dropout"]
-        self.ffn_padding = model_config["variance_predictor"]["ffn_padding"]
-        self.kernel = model_config["variance_predictor"]["predictor_kernel"]
-        self.duration_predictor = DurationPredictor(
-            self.hidden_size,
-            n_chans=self.filter_size,
-            n_layers=model_config["variance_predictor"]["dur_predictor_layers"],
-            dropout_rate=self.dropout, padding=self.ffn_padding,
-            kernel_size=model_config["variance_predictor"]["dur_predictor_kernel"],
-            dur_loss=train_config["loss"]["dur_loss"])
+        self.duration_predictor = ProsodicFeaturesPredictor(
+            d_model,
+            n_chans=predictor_n_int_channels,
+            n_layers=predictor_n_layers,
+            dropout_rate=dropout_rate,
+            kernel_size=predictor_kernel_size)
+        
         self.length_regulator = LengthRegulator()
 
-        if self.use_pitch_embed:
-            n_bins = model_config["variance_embedding"]["pitch_n_bins"]
-            self.pitch_type = preprocess_config["preprocessing"]["pitch"]["pitch_type"]
-            self.use_uv = preprocess_config["preprocessing"]["pitch"]["use_uv"]
-
-            if self.pitch_type == "cwt":
-                self.cwt_std_scale = model_config["variance_predictor"]["cwt_std_scale"]
-                h = model_config["variance_predictor"]["cwt_hidden_size"]
-                cwt_out_dims = 10
-                if self.use_uv:
-                    cwt_out_dims = cwt_out_dims + 1
-                self.cwt_predictor = nn.Sequential(
-                    nn.Linear(self.hidden_size, h),
-                    PitchPredictor(
-                        h,
-                        n_chans=self.filter_size,
-                        n_layers=self.predictor_layers,
-                        dropout_rate=self.dropout, odim=cwt_out_dims,
-                        padding=self.ffn_padding, kernel_size=self.kernel))
-                self.cwt_stats_layers = nn.Sequential(
-                    nn.Linear(self.hidden_size, h), nn.ReLU(),
-                    nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2)
-                )
-            else:
-                self.pitch_predictor = PitchPredictor(
-                    self.hidden_size,
-                    n_chans=self.filter_size,
-                    n_layers=self.predictor_layers,
-                    dropout_rate=self.dropout,
-                    odim=2 if self.pitch_type == "frame" else 1,
-                    padding=self.ffn_padding, kernel_size=self.kernel)
-            self.pitch_embed = Embedding(n_bins, self.hidden_size, padding_idx=0)
-
-        if self.use_energy_embed:
-            dataset_tag = "unsup" if self.learn_alignment else "sup"
-            energy_level_tag, self.energy_feature_level = \
-                get_variance_level(preprocess_config, model_config)
-            assert self.energy_feature_level in ["phoneme_level", "frame_level"]
-            energy_quantization = model_config["variance_embedding"]["energy_quantization"]
-            assert energy_quantization in ["linear", "log"]
-            n_bins = model_config["variance_embedding"]["energy_n_bins"]
-            with open(
-                os.path.join(preprocess_config["path"]["preprocessed_path"], "stats.json")
-            ) as f:
-                stats = json.load(f)
-                energy_min, energy_max = stats[f"energy_{dataset_tag}_{energy_level_tag}"][:2]
-
-            self.energy_predictor = EnergyPredictor(
-                self.hidden_size,
-                n_chans=self.filter_size,
-                n_layers=self.predictor_layers,
-                dropout_rate=self.dropout, odim=1,
-                padding=self.ffn_padding, kernel_size=self.kernel)
-            if energy_quantization == "log":
-                self.energy_bins = nn.Parameter(
-                    torch.exp(
-                        torch.linspace(np.log(energy_min), np.log(energy_max), n_bins - 1)
-                    ),
-                    requires_grad=False,
-                )
-            else:
-                self.energy_bins = nn.Parameter(
-                    torch.linspace(energy_min, energy_max, n_bins - 1),
-                    requires_grad=False,
-                )
-            self.energy_embedding = Embedding(n_bins, self.hidden_size, padding_idx=0)
-
-        if model_config["duration_modeling"]["learn_alignment"]:
-            self.aligner = AlignmentEncoder(
-                n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                n_att_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                n_text_channels=d_model,
-                temperature=model_config["duration_modeling"]["aligner_temperature"],
-                multi_speaker=model_config["multi_speaker"],
+        self._pitch_transform = nn.Sequential(
+            torch.nn.Conv1d(in_channels=1,
+                            out_channels=d_model,
+                            kernel_size=3,
+                            padding='same'),
+            nn.ReLU(),
+            torch.nn.Conv1d(in_channels=d_model,
+                            out_channels=d_model,
+                            kernel_size=3,
+                            padding='same'),
             )
 
-        self.model_type = model_config["prosody_modeling"]["model_type"]
-        if self.model_type == "du2021":
-            assert not self.learn_alignment
-            self.prosody_extractor = ProsodyExtractor(
-                n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                d_model=d_model,
-                kernel_size=model_config["prosody_modeling"]["du2021"]["extractor_kernel_size"],
+        self._pitch_predictor = ProsodicFeaturesPredictor(
+            idim=d_model,
+            n_layers=predictor_n_layers,
+            n_chans=predictor_n_int_channels,
+            kernel_size=predictor_kernel_size,
+            dropout_rate=dropout_rate)
+        
+        self._energy_transform = nn.Sequential(
+            torch.nn.Conv1d(in_channels=1,
+                            out_channels=d_model,
+                            kernel_size=3,
+                            padding='same'),
+            nn.ReLU(),
+            torch.nn.Conv1d(in_channels=d_model,
+                            out_channels=d_model,
+                            kernel_size=3,
+                            padding='same'),
             )
-            self.prosody_predictor = ProsodyPredictor(
-                d_model=d_model,
-                kernel_size=model_config["prosody_modeling"]["du2021"]["predictor_kernel_size"],
-                num_gaussians=model_config["prosody_modeling"]["du2021"]["predictor_num_gaussians"],
-                dropout=model_config["prosody_modeling"]["du2021"]["predictor_dropout"],
-            )
-            self.prosody_linear = LinearNorm(2 * d_model, d_model)
-        elif self.model_type == "liu2021":
-            self.utterance_prosody_encoder = UtteranceLevelProsodyEncoder(
-                preprocess_config, model_config)
-            self.phoneme_prosody_encoder = PhonemeLevelProsodyEncoder(
-                preprocess_config, model_config)
-            # self.utterance_prosody_predictor = NonParallelProsodyPredictor(
-            #     model_config, phoneme_level=False)
-            # self.phoneme_prosody_predictor = NonParallelProsodyPredictor(
-            #     model_config, phoneme_level=True)
-            self.utterance_prosody_predictor = ParallelProsodyPredictor(
-                model_config, phoneme_level=False)
-            self.phoneme_prosody_predictor = ParallelProsodyPredictor(
-                model_config, phoneme_level=True)
-            self.utterance_prosody_prj = nn.Linear(
-                model_config["prosody_modeling"]["liu2021"]["bottleneck_size_u"], model_config["transformer"]["encoder_hidden"])
-            self.phoneme_prosody_prj = nn.Linear(
-                model_config["prosody_modeling"]["liu2021"]["bottleneck_size_p"], model_config["transformer"]["encoder_hidden"])
+
+        self.energy_predictor = ProsodicFeaturesPredictor(
+            idim=d_model,
+            n_layers=predictor_n_layers,
+            n_chans=predictor_n_int_channels,
+            kernel_size=predictor_kernel_size,
+            dropout_rate=dropout_rate)
+
+        self.aligner = AlignmentEncoder(
+            n_mel_channels=n_mel_channels,
+            n_att_channels=n_mel_channels,
+            n_text_channels=d_model,
+            temperature=aligner_temperature,
+            multi_speaker=multi_speaker,
+        )
+
 
     def binarize_attention_parallel(self, attn, in_lens, out_lens):
         """For training purposes only. Binarizes attention with MAS.
@@ -871,247 +813,114 @@ class VarianceAdaptor(nn.Module):
             attn_out = b_mas(attn_cpu, in_lens.cpu().numpy(), out_lens.cpu().numpy(), width=1)
         return torch.from_numpy(attn_out).to(attn.device)
 
-    def get_phoneme_level_pitch(self, phone, src_len, mel2ph, mel_len, pitch_frame):
-        return torch.from_numpy(
-            pad_1D(
-                [get_phoneme_level_pitch(ph[:s_len], m2ph[:m_len], var[:m_len]) for ph, s_len, m2ph, m_len, var \
-                        in zip(phone.int().cpu().numpy(), src_len.cpu().numpy(), mel2ph.cpu().numpy(), mel_len.cpu().numpy(), pitch_frame.cpu().numpy())]
-            )
-        ).float().to(pitch_frame.device)
-
-    def get_phoneme_level_energy(self, duration, src_len, energy_frame):
-        return torch.from_numpy(
-            pad_1D(
-                [get_phoneme_level_energy(dur[:len], var) for dur, len, var \
-                        in zip(duration.int().cpu().numpy(), src_len.cpu().numpy(), energy_frame.cpu().numpy())]
-            )
-        ).float().to(energy_frame.device)
-
-    def get_pitch_embedding(self, decoder_inp, f0, uv, mel2ph, control, encoder_out=None):
-        pitch_pred = f0_denorm = cwt = f0_mean = f0_std = None
-        if self.pitch_type == "ph":
-            pitch_pred_inp = encoder_out.detach() + self.predictor_grad * (encoder_out - encoder_out.detach())
-            pitch_padding = encoder_out.sum().abs() == 0
-            pitch_pred = self.pitch_predictor(pitch_pred_inp) * control
-            if f0 is None:
-                f0 = pitch_pred[:, :, 0]
-            f0_denorm = denorm_f0(f0, None, self.preprocess_config["preprocessing"]["pitch"], pitch_padding=pitch_padding)
-            pitch = f0_to_coarse(f0_denorm)  # start from 0 [B, T_txt]
-            pitch = F.pad(pitch, [1, 0])
-            pitch = torch.gather(pitch, 1, mel2ph)  # [B, T_mel]
-            pitch_embed = self.pitch_embed(pitch)
-        else:
-            decoder_inp = decoder_inp.detach() + self.predictor_grad * (decoder_inp - decoder_inp.detach())
-            pitch_padding = mel2ph == 0
-
-            if self.pitch_type == "cwt":
-                pitch_padding = None
-                cwt = cwt_out = self.cwt_predictor(decoder_inp) * control
-                stats_out = self.cwt_stats_layers(encoder_out[:, 0, :])  # [B, 2]
-                mean = f0_mean = stats_out[:, 0]
-                std = f0_std = stats_out[:, 1]
-                cwt_spec = cwt_out[:, :, :10]
-                if f0 is None:
-                    std = std * self.cwt_std_scale
-                    f0 = cwt2f0_norm(
-                        cwt_spec, mean, std, mel2ph, self.preprocess_config["preprocessing"]["pitch"],
-                    )
-                    if self.use_uv:
-                        assert cwt_out.shape[-1] == 11
-                        uv = cwt_out[:, :, -1] > 0
-            elif self.preprocess_config["preprocessing"]["pitch"]["pitch_ar"]:
-                pitch_pred = self.pitch_predictor(decoder_inp, f0 if self.training else None) * control
-                if f0 is None:
-                    f0 = pitch_pred[:, :, 0]
-            else:
-                pitch_pred = self.pitch_predictor(decoder_inp) * control
-                if f0 is None:
-                    f0 = pitch_pred[:, :, 0]
-                if self.use_uv and uv is None:
-                    uv = pitch_pred[:, :, 1] > 0
-
-            f0_denorm = denorm_f0(f0, uv, self.preprocess_config["preprocessing"]["pitch"], pitch_padding=pitch_padding)
-            if pitch_padding is not None:
-                f0[pitch_padding] = 0
-
-            pitch = f0_to_coarse(f0_denorm)  # start from 0
-            pitch_embed = self.pitch_embed(pitch)
-
-        pitch_pred = {
-            "pitch_pred": pitch_pred,
-            "f0_denorm": f0_denorm,
-            "cwt": cwt,
-            "f0_mean": f0_mean,
-            "f0_std": f0_std,
-        }
-
-        return pitch_pred, pitch_embed
-
-    def get_energy_embedding(self, x, target, mask, control):
-        x.detach() + self.predictor_grad * (x - x.detach())
-        prediction = self.energy_predictor(x, squeeze=True)
-        if target is not None:
-            embedding = self.energy_embedding(torch.bucketize(target, self.energy_bins))
-        else:
-            prediction = prediction * control
-            embedding = self.energy_embedding(
-                torch.bucketize(prediction, self.energy_bins)
-            )
-        return prediction, embedding
-
     def forward(
         self,
-        speaker_embedding,
-        text,
-        text_embedding,
-        src_len,
-        src_mask,
-        mel,
-        mel_len,
-        mel_mask=None,
-        max_len=None,
-        pitch_target=None,
-        energy_target=None,
-        duration_target=None,
-        attn_prior=None,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
-        step=None,
+        phoneme_repr: torch.Tensor,
+        phoneme_lengths: torch.Tensor,
+        phoneme_mask: torch.Tensor,
+        pitch_possible_values: torch.Tensor,
+        energy_possible_values: torch.Tensor,
+        speaker_embedding: Optional[torch.Tensor],
+        binarize_alignment: Optional[bool],
+        mel: Optional[torch.Tensor],
+        mel_lengths: Optional[torch.Tensor],
+        pitch_target: Optional[torch.Tensor],
+        energy_target: Optional[torch.Tensor],
+        attn_prior: Optional[torch.Tensor],
     ):
-        pitch_prediction = energy_prediction = prosody_info = None
+        
+        model_output = {}
+        
+        train_only_inputs = (mel, mel_lengths,
+                             pitch_target, energy_target,
+                             attn_prior, binarize_alignment)
+        
+        if any(el is None for el in train_only_inputs):
+        
+            inference_mode = True
+            assert all(el is None for el in train_only_inputs)    
+        
+        else:
+            inference_mode = False
+            assert all(el is not None for el in train_only_inputs)
 
-        x = text.clone()
-        if speaker_embedding is not None:
-            x = x + speaker_embedding.unsqueeze(1).expand(
-                -1, text.shape[1], -1
+
+        outputs = phoneme_repr
+
+        if self._multi_speaker:
+            assert speaker_embedding is not None
+
+            outputs = outputs + speaker_embedding.unsqueeze(1).expand(
+                -1, phoneme_repr.shape[1], -1
             )
 
-        # GMM-MDN for Phone-Level Prosody Modeling (Du et al., 2021)
-        if self.model_type == "du2021" and not self.learn_alignment:
-            w, sigma, mu = self.prosody_predictor(text, src_mask)
+        predicted_duration = self.duration_predictor(outputs.detach())
+        model_output['predicted_duration'] = predicted_duration
 
-            if self.training:
-                prosody_embeddings = self.prosody_extractor(mel, mel_len, duration_target, src_len)
-            else:
-                prosody_embeddings = self.prosody_predictor.sample(w, sigma, mu)
-            x = x + self.prosody_linear(prosody_embeddings)
-            prosody_info = (w, sigma, mu, prosody_embeddings)
-
-        # Implicit Prosody Modeling (Liu et al., 2021)
-        elif self.model_type == "liu2021":
-            utterance_prosody_embeddings = phoneme_prosody_embeddings = phoneme_prosody_attn = None
-            utterance_prosody_vectors = phoneme_prosody_vectors = None
-            if self.training:
-                utterance_prosody_embeddings = self.utterance_prosody_encoder(mel, mel_mask)
-                phoneme_prosody_embeddings, phoneme_prosody_attn = self.phoneme_prosody_encoder(x, src_len, src_mask, mel, mel_len, mel_mask)
-
-            # x = x + self.utterance_prosody_prj(utterance_prosody_embeddings) # always using prosody extractor (no predictor)
-            # x = x + self.phoneme_prosody_prj(phoneme_prosody_embeddings) # always using prosody extractor (no predictor)
-            utterance_prosody_vectors = self.utterance_prosody_predictor(x)
-            x = x + (self.utterance_prosody_prj(utterance_prosody_embeddings) if self.training else
-                    self.utterance_prosody_prj(utterance_prosody_vectors))
-            phoneme_prosody_vectors = self.phoneme_prosody_predictor(x)
-            x = x + (self.phoneme_prosody_prj(phoneme_prosody_embeddings) if self.training else
-                    self.phoneme_prosody_prj(phoneme_prosody_vectors))
-            prosody_info = (
-                utterance_prosody_embeddings,
-                phoneme_prosody_embeddings,
-                utterance_prosody_vectors,
-                phoneme_prosody_vectors,
-                phoneme_prosody_attn,
-            )
-
-        log_duration_prediction = self.duration_predictor(
-            x.detach() + self.predictor_grad * (x - x.detach()), src_mask
-        )
-
-        # Trainig of unsupervised duration modeling
-        attn_soft, attn_hard, attn_hard_dur, attn_logprob = None, None, None, None
-        if attn_prior is not None:
-            assert self.learn_alignment and duration_target is None and mel is not None
-            attn_soft, attn_logprob = self.aligner(
+        if not inference_mode:
+            attn_soft, att_logprob = self.aligner(
                 mel.transpose(1, 2),
-                text_embedding.transpose(1, 2),
-                src_mask.unsqueeze(-1),
+                phoneme_repr.transpose(1, 2),
+                phoneme_mask.unsqueeze(-1),
                 attn_prior.transpose(1, 2),
                 speaker_embedding,
             )
-            attn_hard = self.binarize_attention_parallel(attn_soft, src_len, mel_len)
+            attn_hard = self.binarize_attention_parallel(attn_soft, phoneme_lengths, mel_lengths)
             attn_hard_dur = attn_hard.sum(2)[:, 0, :]
-        attn_out = (attn_soft, attn_hard, attn_hard_dur, attn_logprob)
-
-        # Upsampling from src length to mel length
-        x_org = x.clone()
-        if attn_prior is not None: # Trainig of unsupervised duration modeling
-            if step < self.binarization_start_steps:
-                A_soft = attn_soft.squeeze(1)
-                x = torch.bmm(A_soft,x)
+        
+            if not binarize_alignment:
+                attn_soft = attn_soft.squeeze(1)
+                outputs = torch.bmm(attn_soft, outputs)
             else:
-                x, mel_len = self.length_regulator(x, attn_hard_dur, max_len)
+                outputs, _ = self.length_regulator(outputs, attn_hard_dur, mel.shape[2])
+
             duration_rounded = attn_hard_dur
-            pitch_target["mel2ph"] = dur_to_mel2ph(duration_rounded, src_mask)[:, : max_len]
-        elif duration_target is not None: # Trainig of supervised duration modeling
-            assert not self.learn_alignment and attn_prior is None
-            x, mel_len = self.length_regulator(x, duration_target, max_len)
-            duration_rounded = duration_target
-        else: # Inference
-            assert attn_prior is None and duration_target is None
-            duration_rounded = torch.clamp(
-                (torch.round(torch.exp(log_duration_prediction) - 1) * d_control),
-                min=0,
-            )
-            x, mel_len = self.length_regulator(x, duration_rounded, max_len)
-            mel_mask = get_mask_from_lengths(mel_len)
-            mel2ph = dur_to_mel2ph(duration_rounded, src_mask)
 
-        # Note that there is no pre-extracted phoneme-level variance features in unsupervised duration modeling.
-        # Alternatively, we can use attn_hard_dur instead of duration_target for computing phoneme-level variances.
-        x_temp = x.clone()
-        if self.use_pitch_embed:
-            if pitch_target is not None:
-                mel2ph = pitch_target["mel2ph"]
-                if self.pitch_type == "cwt":
-                    cwt_spec = pitch_target[f"cwt_spec"]
-                    f0_mean = pitch_target["f0_mean"]
-                    f0_std = pitch_target["f0_std"]
-                    pitch_target["f0"] = cwt2f0_norm(
-                        cwt_spec, f0_mean, f0_std, mel2ph, self.preprocess_config["preprocessing"]["pitch"],
-                    )
-                    pitch_target.update({"f0_cwt": pitch_target["f0"]})
-                if self.pitch_type == "ph":
-                    pitch_target["f0"] = self.get_phoneme_level_pitch(text, src_len, mel2ph, mel_len, pitch_target["f0"])
-                pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                    x, pitch_target["f0"], pitch_target["uv"], mel2ph, p_control, encoder_out=x_org
-                )
-            else:
-                pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                    x, None, None, mel2ph, p_control, encoder_out=x_org
-                )
-            x_temp = x_temp + pitch_embedding
-        if self.use_energy_embed and self.energy_feature_level == "frame_level":
-            energy_prediction, energy_embedding = self.get_energy_embedding(x, energy_target, mel_mask, e_control)
-            x_temp = x_temp + energy_embedding
-        elif self.use_energy_embed and self.energy_feature_level == "phoneme_level":
-            if attn_prior is not None:
-                energy_target = self.get_phoneme_level_energy(attn_hard_dur, src_len, energy_target)
-            energy_prediction, energy_embedding = self.get_energy_embedding(x_org, energy_target, src_mask, e_control)
-            x_temp = x_temp + self.length_regulator(energy_embedding, duration_rounded, max_len)[0]
-        x = x_temp.clone()
+            model_output['attn_soft'] = attn_soft
+            model_output['attn_hard'] = attn_hard
+            model_output['attn_logprob'] = att_logprob
+            model_output['duration_rounded'] = duration_rounded
 
-        return (
-            x,
-            pitch_target,
-            pitch_prediction,
-            energy_target,
-            energy_prediction,
-            log_duration_prediction,
-            duration_rounded,
-            mel_len,
-            mel_mask,
-            attn_out,
-            prosody_info,
-        )
+        else:
+            duration_rounded = torch.clamp(torch.round(predicted_duration), min=0)
+            mel_lengths = duration_rounded.sum(dim=1).long()
+            outputs, _ = self.length_regulator(outputs,
+                                               duration_rounded,
+                                               max_len=mel_lengths.max())
+
+        predicted_pitch = self._pitch_predictor(outputs.detach())
+        predicted_energy = self.energy_predictor(outputs.detach())
+
+        model_output['predicted_pitch'] = predicted_pitch
+        model_output['predicted_energy'] = predicted_energy
+
+        if not inference_mode:
+            chosen_pitch = pitch_target
+            chosen_energy = energy_target
+
+        else:
+            chosen_pitch = predicted_pitch
+            chosen_energy = predicted_energy
+
+        pitch_indices = torch.bucketize(chosen_pitch, pitch_possible_values)
+        energy_indices = torch.bucketize(chosen_energy, energy_possible_values)
+
+        pitch_quant = self._pitch_predictor[pitch_indices - 1]
+        energy_quant = self._energy_transform[energy_indices - 1]
+
+        if not inference_mode:
+            model_output['target_pitch_quant'] = pitch_quant
+            model_output['target_energy_quant'] = energy_quant
+
+        pitch_enc = self._pitch_transform(pitch_quant.transpose(1, 2)).transpose(1, 2)
+        energy_enc = self._energy_transform(energy_quant.transpose(1, 2)).transpose(1, 2)
+
+        outputs = outputs + pitch_enc + energy_enc
+
+        model_output['output'] = outputs
+
+        return model_output
+
 
 
 class AlignmentEncoder(torch.nn.Module):
@@ -1249,71 +1058,16 @@ class LengthRegulator(nn.Module):
         return output, mel_len
 
 
-class DurationPredictor(torch.nn.Module):
-    """Duration predictor module.
-    This is a module of duration predictor described in `FastSpeech: Fast, Robust and Controllable Text to Speech`_.
-    The duration predictor predicts a duration of each frame in log domain from the hidden embeddings of encoder.
-    .. _`FastSpeech: Fast, Robust and Controllable Text to Speech`:
-        https://arxiv.org/pdf/1905.09263.pdf
-    Note:
-        The outputs are calculated in log domain.
-    """
+class ProsodicFeaturesPredictor(torch.nn.Module):
+    """Predicts prosody features from stratched textual features."""
 
-    def __init__(self, idim, n_layers=2, n_chans=384, kernel_size=3, dropout_rate=0.1, offset=1.0, padding="SAME", dur_loss="mse"):
-        """Initilize duration predictor module.
-        Args:
-            idim (int): Input dimension.
-            n_layers (int, optional): Number of convolutional layers.
-            n_chans (int, optional): Number of channels of convolutional layers.
-            kernel_size (int, optional): Kernel size of convolutional layers.
-            dropout_rate (float, optional): Dropout rate.
-            offset (float, optional): Offset value to avoid nan in log domain.
-        """
-        super(DurationPredictor, self).__init__()
-        self.offset = offset
-        self.conv = torch.nn.ModuleList()
-        self.kernel_size = kernel_size
-        self.padding = padding
-        self.dur_loss = dur_loss
-        for idx in range(n_layers):
-            in_chans = idim if idx == 0 else n_chans
-            self.conv += [torch.nn.Sequential(
-                torch.nn.ConstantPad1d(((kernel_size - 1) // 2, (kernel_size - 1) // 2)
-                                       if padding == "SAME"
-                                       else (kernel_size - 1, 0), 0),
-                torch.nn.Conv1d(in_chans, n_chans, kernel_size, stride=1, padding=0),
-                torch.nn.ReLU(),
-                LayerNorm(n_chans, dim=1),
-                torch.nn.Dropout(dropout_rate)
-            )]
-        if self.dur_loss in ["mse", "huber"]:
-            odims = 1
-        elif self.dur_loss == "mog":
-            odims = 15
-        elif self.dur_loss == "crf":
-            odims = 32
-            from torchcrf import CRF
-            self.crf = CRF(odims, batch_first=True)
-        self.linear = torch.nn.Linear(n_chans, odims)
-
-    def forward(self, xs, x_masks=None):
-        xs = xs.transpose(1, -1)  # (B, idim, Tmax)
-        for f in self.conv:
-            xs = f(xs)  # (B, C, Tmax)
-            if x_masks is not None:
-                xs = xs * (1 - x_masks.float())[:, None, :]
-
-        xs = self.linear(xs.transpose(1, -1))  # [B, T, C]
-        xs = xs * (1 - x_masks.float())[:, :, None]  # (B, T, C)
-        if self.dur_loss in ["mse"]:
-            xs = xs.squeeze(-1)  # (B, Tmax)
-        return xs
-
-
-class PitchPredictor(torch.nn.Module):
-    def __init__(self, idim, n_layers=5, n_chans=384, odim=2, kernel_size=5,
-                 dropout_rate=0.1, padding="SAME"):
-        """Initilize pitch predictor module.
+    def __init__(self,
+                 idim: int,
+                 n_layers: int,
+                 n_chans: int,
+                 kernel_size: int,
+                 dropout_rate: float):
+        """Initilize prosody predictor module.
         Args:
             idim (int): Input dimension.
             n_layers (int, optional): Number of convolutional layers.
@@ -1321,26 +1075,26 @@ class PitchPredictor(torch.nn.Module):
             kernel_size (int, optional): Kernel size of convolutional layers.
             dropout_rate (float, optional): Dropout rate.
         """
-        super(PitchPredictor, self).__init__()
+        
+        super().__init__()
+        
         self.conv = torch.nn.ModuleList()
         self.kernel_size = kernel_size
-        self.padding = padding
         for idx in range(n_layers):
             in_chans = idim if idx == 0 else n_chans
             self.conv += [torch.nn.Sequential(
-                torch.nn.ConstantPad1d(((kernel_size - 1) // 2, (kernel_size - 1) // 2)
-                                       if padding == "SAME"
-                                       else (kernel_size - 1, 0), 0),
-                torch.nn.Conv1d(in_chans, n_chans, kernel_size, stride=1, padding=0),
+                torch.nn.Conv1d(in_chans, n_chans, kernel_size, stride=1, padding='same'),
                 torch.nn.ReLU(),
                 LayerNorm(n_chans, dim=1),
                 torch.nn.Dropout(dropout_rate)
             )]
-        self.linear = torch.nn.Linear(n_chans, odim)
+
+        torch.nn.Linear(n_chans, 1)
+        
         self.embed_positions = SinusoidalPositionalEmbedding(idim, 0, init_size=4096)
         self.pos_embed_alpha = nn.Parameter(torch.Tensor([1]))
 
-    def forward(self, xs, squeeze=False):
+    def forward(self, xs):
         """
 
         :param xs: [B, T, H]
@@ -1351,10 +1105,6 @@ class PitchPredictor(torch.nn.Module):
         xs = xs.transpose(1, -1)  # (B, idim, Tmax)
         for f in self.conv:
             xs = f(xs)  # (B, C, Tmax)
-        # NOTE: calculate in log domain
-        xs = self.linear(xs.transpose(1, -1))  # (B, Tmax, H)
-        return xs.squeeze(-1) if squeeze else xs
+        
+        return self._postnet(xs.transpose(1, -1)).squeeze(-1) # [B, T]
 
-
-class EnergyPredictor(PitchPredictor):
-    pass
