@@ -740,11 +740,14 @@ class VarianceAdaptor(nn.Module):
                  predictor_n_layers: int,
                  predictor_n_int_channels: int,
                  predictor_kernel_size: int,
-                 dropout_rate: float):
+                 dropout_rate: float,
+                 spk_emb_dim: int):
         
         super().__init__()
 
         self._multi_speaker = multi_speaker
+
+        self._spk_emb_enc = nn.Linear(spk_emb_dim, d_model)
 
         self.duration_predictor = ProsodicFeaturesPredictor(
             d_model,
@@ -850,7 +853,9 @@ class VarianceAdaptor(nn.Module):
         if self._multi_speaker:
             assert speaker_embedding is not None
 
-            outputs = outputs + speaker_embedding.unsqueeze(1).expand(
+            spk_emb_encoded = self._spk_emb_enc(speaker_embedding)
+
+            outputs = outputs + spk_emb_encoded.unsqueeze(1).expand(
                 -1, phoneme_repr.shape[1], -1
             )
 
@@ -859,14 +864,15 @@ class VarianceAdaptor(nn.Module):
 
         if not inference_mode:
             attn_soft, att_logprob = self.aligner(
-                mel.transpose(1, 2),
+                mel,
                 phoneme_repr.transpose(1, 2),
                 phoneme_mask.unsqueeze(-1),
-                attn_prior.transpose(1, 2),
-                speaker_embedding,
+                attn_prior,
+                spk_emb_encoded,
             )
             attn_hard = self.binarize_attention_parallel(attn_soft, phoneme_lengths, mel_lengths)
-            attn_hard_dur = attn_hard.sum(2)[:, 0, :]
+            attn_hard = attn_hard.squeeze(1)
+            attn_hard_dur = attn_hard.sum(1)
         
             if not binarize_alignment:
                 attn_soft = attn_soft.squeeze(1)
@@ -905,17 +911,17 @@ class VarianceAdaptor(nn.Module):
         pitch_indices = torch.bucketize(chosen_pitch, pitch_possible_values)
         energy_indices = torch.bucketize(chosen_energy, energy_possible_values)
 
-        pitch_quant = self._pitch_predictor[pitch_indices - 1]
-        energy_quant = self._energy_transform[energy_indices - 1]
+        pitch_quant = pitch_possible_values[pitch_indices - 1]
+        energy_quant = energy_possible_values[energy_indices - 1]
 
         if not inference_mode:
             model_output['target_pitch_quant'] = pitch_quant
             model_output['target_energy_quant'] = energy_quant
 
-        pitch_enc = self._pitch_transform(pitch_quant.transpose(1, 2)).transpose(1, 2)
-        energy_enc = self._energy_transform(energy_quant.transpose(1, 2)).transpose(1, 2)
+        pitch_enc = self._pitch_transform(pitch_quant.unsqueeze(-1).transpose(1, 2))
+        energy_enc = self._energy_transform(energy_quant.unsqueeze(-1).transpose(1, 2))
 
-        outputs = outputs + pitch_enc + energy_enc
+        outputs = outputs + pitch_enc.transpose(1, 2) + energy_enc.transpose(1, 2)
 
         model_output['output'] = outputs
 
@@ -1089,7 +1095,7 @@ class ProsodicFeaturesPredictor(torch.nn.Module):
                 torch.nn.Dropout(dropout_rate)
             )]
 
-        torch.nn.Linear(n_chans, 1)
+        self._postnet = torch.nn.Linear(n_chans, 1)
         
         self.embed_positions = SinusoidalPositionalEmbedding(idim, 0, init_size=4096)
         self.pos_embed_alpha = nn.Parameter(torch.Tensor([1]))
