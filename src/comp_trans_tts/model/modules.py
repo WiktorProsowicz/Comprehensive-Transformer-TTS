@@ -820,7 +820,6 @@ class VarianceAdaptor(nn.Module):
         self,
         phoneme_repr: torch.Tensor,
         phoneme_lengths: torch.Tensor,
-        phoneme_mask: torch.Tensor,
         pitch_possible_values: torch.Tensor,
         energy_possible_values: torch.Tensor,
         speaker_embedding: Optional[torch.Tensor],
@@ -830,13 +829,14 @@ class VarianceAdaptor(nn.Module):
         pitch_target: Optional[torch.Tensor],
         energy_target: Optional[torch.Tensor],
         attn_prior: Optional[torch.Tensor],
+        att_mask: Optional[torch.Tensor],
     ):
         
         model_output = {}
         
         train_only_inputs = (mel, mel_lengths,
                              pitch_target, energy_target,
-                             attn_prior, binarize_alignment)
+                             attn_prior, binarize_alignment, att_mask)
         
         if any(el is None for el in train_only_inputs):
         
@@ -866,11 +866,11 @@ class VarianceAdaptor(nn.Module):
             attn_soft, att_logprob = self.aligner(
                 mel,
                 phoneme_repr.transpose(1, 2),
-                phoneme_mask.unsqueeze(-1),
+                att_mask,
                 attn_prior,
                 spk_emb_encoded,
             )
-            attn_hard = self.binarize_attention_parallel(attn_soft, phoneme_lengths, mel_lengths)
+            attn_hard = self.binarize_attention_parallel(attn_soft.unsqueeze(1), phoneme_lengths, mel_lengths)
             attn_hard = attn_hard.squeeze(1)
             attn_hard_dur = attn_hard.sum(1)
         
@@ -927,7 +927,26 @@ class VarianceAdaptor(nn.Module):
 
         return model_output
 
+class MaskedSoftmax(torch.nn.Module):
+	def __init__(self, dim=-1, is_log_softmax=False):
+		super().__init__()
 
+		if is_log_softmax:
+			self.softmax = torch.nn.LogSoftmax(dim=dim)
+		else:
+			self.softmax = torch.nn.Softmax(dim=dim)
+
+	def forward(self, x, mask):
+		
+		if mask is not None:
+			x.data.masked_fill_(~mask, -float("inf"))
+
+		smax = self.softmax(x)
+
+		if mask is not None:
+			smax.data.masked_fill_(~mask, 0.0)
+
+		return smax
 
 class AlignmentEncoder(torch.nn.Module):
     """ Alignment Encoder for Unsupervised Duration Modeling """
@@ -940,8 +959,8 @@ class AlignmentEncoder(torch.nn.Module):
                 multi_speaker):
         super().__init__()
         self.temperature = temperature
-        self.softmax = torch.nn.Softmax(dim=3)
-        self.log_softmax = torch.nn.LogSoftmax(dim=3)
+        self.softmax = MaskedSoftmax(dim=2)
+        self.log_softmax = MaskedSoftmax(dim=2, is_log_softmax=True)
 
         self.key_proj = nn.Sequential(
             ConvNorm(
@@ -1012,19 +1031,16 @@ class AlignmentEncoder(torch.nn.Module):
 
         # Simplistic Gaussian Isotopic Attention
         attn = (queries_enc[:, :, :, None] - keys_enc[:, :, None]) ** 2  # B x n_attn_dims x T1 x T2
-        attn = -self.temperature * attn.sum(1, keepdim=True)
+        attn = -self.temperature * attn.sum(1, keepdim=False)
 
         if attn_prior is not None:
             #print(f"AlignmentEncoder \t| mel: {queries.shape} phone: {keys.shape} mask: {mask.shape} attn: {attn.shape} attn_prior: {attn_prior.shape}")
-            attn = self.log_softmax(attn) + torch.log(attn_prior[:, None] + 1e-8)
+            attn = self.log_softmax(attn, mask) + (torch.log(attn_prior + 1e-8) * mask)
             #print(f"AlignmentEncoder \t| After prior sum attn: {attn.shape}")
 
         attn_logprob = attn.clone()
 
-        if mask is not None:
-            attn.data.masked_fill_(mask.permute(0, 2, 1).unsqueeze(2), -float("inf"))
-
-        attn = self.softmax(attn)  # softmax along T2
+        attn = self.softmax(attn, mask)  # softmax along T2
         return attn, attn_logprob
 
 
