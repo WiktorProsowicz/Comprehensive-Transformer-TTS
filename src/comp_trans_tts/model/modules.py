@@ -928,25 +928,42 @@ class VarianceAdaptor(nn.Module):
         return model_output
 
 class MaskedSoftmax(torch.nn.Module):
-	def __init__(self, dim=-1, is_log_softmax=False):
-		super().__init__()
 
-		if is_log_softmax:
-			self.softmax = torch.nn.LogSoftmax(dim=dim)
-		else:
-			self.softmax = torch.nn.Softmax(dim=dim)
+    def __init__(self, dim=-1):
+        super().__init__()
 
-	def forward(self, x, mask):
+        self._softmax = torch.nn.Softmax(dim=dim)
+
+    def forward(self, x, mask):
 		
-		if mask is not None:
-			x.data.masked_fill_(~mask, -float("inf"))
+        if mask is not None:
+            x.data.masked_fill_(~mask, -float("inf"))
 
-		smax = self.softmax(x)
+        smax = self._softmax(x)
 
-		if mask is not None:
-			smax.data.masked_fill_(~mask, 0.0)
+        if mask is not None:
+            smax.data.masked_fill_(~mask, 0.0)
 
-		return smax
+        return smax
+    
+class MaskedLogSoftmax(torch.nn.Module):
+    
+    def __init__(self, dim=-1):
+        super().__init__()
+
+        self._softmax = torch.nn.LogSoftmax(dim=dim)
+
+    def forward(self, x, mask):
+		
+        if mask is not None:
+            x.data.masked_fill_(~mask, -float("inf"))
+
+        smax = self._softmax(x)
+
+        if mask is not None:
+            smax.data.masked_fill_(~mask, -float("inf"))
+
+        return smax
 
 class AlignmentEncoder(torch.nn.Module):
     """ Alignment Encoder for Unsupervised Duration Modeling """
@@ -960,7 +977,7 @@ class AlignmentEncoder(torch.nn.Module):
         super().__init__()
         self.temperature = temperature
         self.softmax = MaskedSoftmax(dim=2)
-        self.log_softmax = MaskedSoftmax(dim=2, is_log_softmax=True)
+        self.log_softmax = MaskedLogSoftmax(dim=2)
 
         self.key_proj = nn.Sequential(
             ConvNorm(
