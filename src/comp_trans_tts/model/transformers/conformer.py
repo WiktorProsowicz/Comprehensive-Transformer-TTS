@@ -244,7 +244,7 @@ class ConformerBlock(nn.Module):
                            keys=output,
                            values=output,
                            query_mask=input_mask,
-                           key_mask=input_mask)
+                           key_mask=input_mask) + output
 
         output = self._att_drop(output)
         output = self._conv(output)
