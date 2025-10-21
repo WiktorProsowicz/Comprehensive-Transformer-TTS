@@ -722,6 +722,20 @@ class NonParallelProsodyPredictor(nn.Module):
         prosody_vector = self.predictor_bottleneck(prosody_vector)
 
         return prosody_vector
+    
+
+@torch.no_grad()
+def mask_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
+
+    batch_size = lengths.size(0)
+
+    max_len = torch.max(lengths).item()
+    mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=lengths.device)
+
+    for i in range(batch_size):
+        mask[i, :lengths[i]] = 1
+
+    return mask
 
 
 class VarianceAdaptor(nn.Module):
@@ -734,8 +748,6 @@ class VarianceAdaptor(nn.Module):
 
     def __init__(self,
                  d_model: int,
-                 n_mel_channels: int,
-                 aligner_temperature: float,
                  multi_speaker: bool,
                  predictor_n_layers: int,
                  predictor_n_int_channels: int,
@@ -796,26 +808,6 @@ class VarianceAdaptor(nn.Module):
             kernel_size=predictor_kernel_size,
             dropout_rate=dropout_rate)
 
-        self.aligner = AlignmentEncoder(
-            n_mel_channels=n_mel_channels,
-            n_att_channels=n_mel_channels,
-            n_text_channels=d_model,
-            temperature=aligner_temperature,
-            multi_speaker=multi_speaker,
-        )
-
-
-    def binarize_attention_parallel(self, attn, in_lens, out_lens):
-        """For training purposes only. Binarizes attention with MAS.
-        These will no longer recieve a gradient.
-        Args:
-            attn: B x 1 x max_mel_len x max_text_len
-        """
-        with torch.no_grad():
-            attn_cpu = attn.data.cpu().numpy()
-            attn_out = b_mas(attn_cpu, in_lens.cpu().numpy(), out_lens.cpu().numpy(), width=1)
-        return torch.from_numpy(attn_out).to(attn.device)
-
     def forward(
         self,
         phoneme_repr: torch.Tensor,
@@ -823,20 +815,14 @@ class VarianceAdaptor(nn.Module):
         pitch_possible_values: torch.Tensor,
         energy_possible_values: torch.Tensor,
         speaker_embedding: Optional[torch.Tensor],
-        binarize_alignment: Optional[bool],
-        mel: Optional[torch.Tensor],
-        mel_lengths: Optional[torch.Tensor],
         pitch_target: Optional[torch.Tensor],
         energy_target: Optional[torch.Tensor],
-        attn_prior: Optional[torch.Tensor],
-        att_mask: Optional[torch.Tensor],
+        explicit_duration: Optional[torch.Tensor]
     ):
         
         model_output = {}
         
-        train_only_inputs = (mel, mel_lengths,
-                             pitch_target, energy_target,
-                             attn_prior, binarize_alignment, att_mask)
+        train_only_inputs = (pitch_target, energy_target, explicit_duration)
         
         if any(el is None for el in train_only_inputs):
         
@@ -863,35 +849,16 @@ class VarianceAdaptor(nn.Module):
         model_output['predicted_duration'] = predicted_duration
 
         if not inference_mode:
-            attn_soft, att_logprob = self.aligner(
-                mel,
-                phoneme_repr.transpose(1, 2),
-                att_mask,
-                attn_prior,
-                spk_emb_encoded,
-            )
-            attn_hard = self.binarize_attention_parallel(attn_soft.unsqueeze(1), phoneme_lengths, mel_lengths)
-            attn_hard = attn_hard.squeeze(1)
-            attn_hard_dur = attn_hard.sum(1)
-        
-            if not binarize_alignment:
-                attn_soft = attn_soft.squeeze(1)
-                outputs = torch.bmm(attn_soft, outputs)
-            else:
-                outputs, _ = self.length_regulator(outputs, attn_hard_dur, mel.shape[2])
-
-            duration_rounded = attn_hard_dur
-
-            model_output['attn_soft'] = attn_soft
-            model_output['attn_hard'] = attn_hard
-            model_output['attn_logprob'] = att_logprob
-            model_output['duration_rounded'] = duration_rounded
+            outputs, _ = self.length_regulator(outputs, explicit_duration, pitch_target.shape[1])
+            model_output['duration_rounded'] = explicit_duration
 
         else:
             duration_rounded = torch.clamp(torch.round(predicted_duration), min=0)
+            duration_rounded *= mask_from_lengths(phoneme_lengths)
+
             mel_lengths = duration_rounded.sum(dim=1).long()
             outputs, _ = self.length_regulator(outputs,
-                                               duration_rounded,
+                                               duration_rounded.long(),
                                                max_len=mel_lengths.max())
 
         predicted_pitch = self._pitch_predictor(outputs.detach())
@@ -1119,19 +1086,22 @@ class ProsodicFeaturesPredictor(torch.nn.Module):
         
         self.conv = torch.nn.ModuleList()
         self.kernel_size = kernel_size
-        for idx in range(n_layers):
-            in_chans = idim if idx == 0 else n_chans
+
+        self._prenet = torch.nn.Sequential(
+            torch.nn.Linear(idim, n_chans),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout_rate)
+        )
+
+        for _ in range(n_layers):
             self.conv += [torch.nn.Sequential(
-                torch.nn.Conv1d(in_chans, n_chans, kernel_size, stride=1, padding='same'),
+                torch.nn.BatchNorm1d(n_chans),
+                torch.nn.Conv1d(n_chans, n_chans, kernel_size, stride=1, padding='same'),
                 torch.nn.ReLU(),
-                LayerNorm(n_chans, dim=1),
-                torch.nn.Dropout(dropout_rate)
+                torch.nn.Dropout1d(dropout_rate)
             )]
 
         self._postnet = torch.nn.Linear(n_chans, 1)
-        
-        self.embed_positions = SinusoidalPositionalEmbedding(idim, 0, init_size=4096)
-        self.pos_embed_alpha = nn.Parameter(torch.Tensor([1]))
 
     def forward(self, xs):
         """
@@ -1139,8 +1109,8 @@ class ProsodicFeaturesPredictor(torch.nn.Module):
         :param xs: [B, T, H]
         :return: [B, T, H]
         """
-        positions = self.pos_embed_alpha * self.embed_positions(xs[..., 0])
-        xs = xs + positions
+        xs = self._prenet(xs)
+
         xs = xs.transpose(1, -1)  # (B, idim, Tmax)
         for f in self.conv:
             xs = f(xs)  # (B, C, Tmax)
