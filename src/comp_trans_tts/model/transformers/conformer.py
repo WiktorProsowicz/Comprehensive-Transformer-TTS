@@ -237,6 +237,12 @@ class ConformerBlock(nn.Module):
     def forward(self,
                 inputs: Tensor,
                 input_mask: Tensor) -> Tensor:
+        """
+        Args:
+            inputs: (batch, time, dim): Tensor containing input vector.
+            input_mask: (batch, time): Boolean tensor containing true values for NON-PADDING
+                elements.
+        """
         
         output = self._ff1(inputs)
         output = self._att_norm(output)
@@ -322,32 +328,43 @@ class MultiHeadedSelfAttentionModule(nn.Module):
     Returns:
         - **outputs** (batch, time, dim): Tensor produces by relative multi headed self attention module.
     """
-    def __init__(self, d_model: int, num_heads: int, dropout_p: float = 0.1, position_enc: Optional[Tensor] = None, max_seq_len: int = 10000):
+    def __init__(self, d_model: int, num_heads: int, dropout_p: float = 0.1, max_seq_len: int = 10000):
         super(MultiHeadedSelfAttentionModule, self).__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
-        self.positional_encoding = position_enc
-        self.layer_norm = nn.LayerNorm(d_model)
+        self.positional_encoding = get_sinusoid_encoding_table(
+            max_seq_len, d_model
+        )
         self.attention = RelativeMultiHeadAttention(d_model, num_heads, dropout_p)
         self.dropout = nn.Dropout(p=dropout_p)
 
-    def forward(self, inputs: Tensor, mask: Optional[Tensor] = None):
-        batch_size, seq_length, _ = inputs.size()
+    def forward(self,
+                queries: torch.Tensor,
+                keys: torch.Tensor,
+                values: torch.Tensor,
+                key_mask: Optional[torch.Tensor],
+                query_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        
+        batch_size, seq_length, _ = queries.size()
 
         # -- Forward
         if not self.training and seq_length > self.max_seq_len:
             pos_embedding = get_sinusoid_encoding_table(
                 seq_length, self.d_model
             )[: seq_length, :].unsqueeze(0).expand(batch_size, -1, -1).to(
-                inputs.device
+                queries.device
             )
         else:
             pos_embedding = self.positional_encoding[
                 :, :seq_length, :
             ].expand(batch_size, -1, -1)
 
-        inputs = self.layer_norm(inputs)
-        outputs = self.attention(inputs, inputs, inputs, pos_embedding=pos_embedding, mask=mask)
+        outputs = self.attention(queries,
+                                 keys,
+                                 values,
+                                 pos_embedding=pos_embedding,
+                                 key_mask=torch.bitwise_not(key_mask),
+                                 query_mask=torch.bitwise_not(query_mask))
 
         return self.dropout(outputs)
 
@@ -401,7 +418,8 @@ class RelativeMultiHeadAttention(nn.Module):
             key: Tensor,
             value: Tensor,
             pos_embedding: Tensor,
-            mask: Optional[Tensor] = None,
+            key_mask: Optional[Tensor] = None,
+            query_mask: Optional[Tensor] = None
     ) -> Tensor:
         batch_size = value.size(0)
 
@@ -416,8 +434,8 @@ class RelativeMultiHeadAttention(nn.Module):
 
         score = (content_score + pos_score) / self.sqrt_dim
 
-        if mask is not None:
-            mask = mask.unsqueeze(1)
+        if query_mask is not None and key_mask is not None:
+            mask = query_mask.unsqueeze(2) & key_mask.unsqueeze(1)
             score.masked_fill_(mask, -1e9)
 
         attn = F.softmax(score, -1)
