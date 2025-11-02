@@ -3,7 +3,7 @@ import json
 import copy
 import math
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -333,39 +333,37 @@ class ProsodyPredictor(nn.Module):
 class ReferenceEncoder(nn.Module):
     """ Reference Mel Encoder """
 
-    def __init__(self, preprocess_config, model_config):
+    def __init__(self,
+                 n_mel_channels: int,
+                 conv_filters: List[int],
+                 conv_kernel_size: int,
+                 conv_stride: int,
+                 gru_size: int,
+                 dropout_rate: float):
         super(ReferenceEncoder, self).__init__()
 
-        E = model_config["transformer"]["encoder_hidden"]
-        n_mel_channels = preprocess_config["preprocessing"]["mel"]["n_mel_channels"]
-        ref_enc_filters = model_config["prosody_modeling"]["liu2021"]["ref_enc_filters"]
-        ref_enc_size = model_config["prosody_modeling"]["liu2021"]["ref_enc_size"]
-        ref_enc_strides = model_config["prosody_modeling"]["liu2021"]["ref_enc_strides"]
-        ref_enc_pad = model_config["prosody_modeling"]["liu2021"]["ref_enc_pad"]
-        ref_enc_gru_size = model_config["prosody_modeling"]["liu2021"]["ref_enc_gru_size"]
-
+        self._dropout_rate = dropout_rate
         self.n_mel_channels = n_mel_channels
-        K = len(ref_enc_filters)
-        filters = [1] + ref_enc_filters
+        filters = [1] + conv_filters
         # Use CoordConv at the first layer to better preserve positional information: https://arxiv.org/pdf/1811.02122.pdf
         convs = [CoordConv2d(in_channels=filters[0],
-                           out_channels=filters[0 + 1],
-                           kernel_size=ref_enc_size,
-                           stride=ref_enc_strides,
-                           padding=ref_enc_pad, with_r=True)]
+                             out_channels=filters[0 + 1],
+                             kernel_size=conv_kernel_size,
+                             stride=conv_stride,
+                             padding='same', with_r=True)]
         convs2 = [nn.Conv2d(in_channels=filters[i],
-                           out_channels=filters[i + 1],
-                           kernel_size=ref_enc_size,
-                           stride=ref_enc_strides,
-                           padding=ref_enc_pad) for i in range(1,K)]
+                            out_channels=filters[i + 1],
+                            kernel_size=conv_kernel_size,
+                            stride=conv_stride,
+                            padding='same') for i in range(1, len(conv_filters))]
         convs.extend(convs2)
         self.convs = nn.ModuleList(convs)
         self.bns = nn.ModuleList(
-            [nn.BatchNorm2d(num_features=ref_enc_filters[i]) for i in range(K)])
+            [nn.BatchNorm2d(num_features=n_filters) for n_filters in conv_filters])
 
-        out_channels = self.calculate_channels(n_mel_channels, 3, 2, 1, K)
-        self.gru = nn.GRU(input_size=ref_enc_filters[-1] * out_channels,
-                          hidden_size=ref_enc_gru_size,
+        out_channels = self.calculate_channels(n_mel_channels, 3, 2, 1, len(conv_filters))
+        self.gru = nn.GRU(input_size=conv_filters[-1] * out_channels,
+                          hidden_size=gru_size,
                           batch_first=True)
 
     def forward(self, inputs, mask=None):
@@ -379,6 +377,7 @@ class ReferenceEncoder(nn.Module):
             out = conv(out)
             out = bn(out)
             out = F.relu(out)  # [N, 128, Ty//2^K, n_mels//2^K]
+            out = F.dropout2d(out, p=self._dropout_rate)
 
         out = out.transpose(1, 2)  # [N, Ty//2^K, 128, n_mels//2^K]
         T = out.size(1)
@@ -454,27 +453,26 @@ class PhonemeLevelProsodyEncoder(nn.Module):
 class STL(nn.Module):
     """ Style Token Layer """
 
-    def __init__(self, preprocess_config, model_config):
+    def __init__(self,
+                 d_model: int,
+                 n_tokens: int):
         super(STL, self).__init__()
 
-        num_heads = 1
-        E = model_config["transformer"]["encoder_hidden"]
-        self.token_num = model_config["prosody_modeling"]["liu2021"]["token_num"]
-        self.embed = nn.Parameter(torch.FloatTensor(
-            self.token_num, E // num_heads))
-        d_q = E // 2
-        d_k = E // num_heads
+        self.embed = nn.Parameter(torch.FloatTensor(n_tokens, d_model))
+        
+        self._input_ref_proj = nn.Linear(d_model, d_model // 2)
+
         self.attention = StyleEmbedAttention(
-            query_dim=d_q, key_dim=d_k, num_units=E, num_heads=num_heads)
+            query_dim=d_model // 2, key_dim=d_model, num_units=d_model, num_heads=1)
 
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
 
-    def forward(self, inputs):
-        N = inputs.size(0)
-        query = inputs.unsqueeze(1)  # [N, 1, E//2]
+    def forward(self, encoded_reference: torch.Tensor):
+        batch_size = encoded_reference.size(0)
+        query = self._input_ref_proj(encoded_reference).unsqueeze(1)  # [N, 1, E//2]
 
         keys_soft = torch.tanh(self.embed).unsqueeze(0).expand(
-            N, -1, -1)  # [N, token_num, E // num_heads]
+            batch_size, -1, -1)  # [N, token_num, E // num_heads]
 
         # Weighted sum
         emotion_embed_soft = self.attention(query, keys_soft)
@@ -538,20 +536,24 @@ class StyleEmbedAttention(nn.Module):
 class UtteranceLevelProsodyEncoder(nn.Module):
     """ Utterance-level Prosody Encoder """
 
-    def __init__(self, preprocess_config, model_config):
+    def __init__(self,
+                 encoder_hidden_size: int,
+                 input_mel_channels: int,
+                 ref_enc_filters: List[int],
+                 ref_enc_gru_size: int,
+                 ref_enc_kernel_size: int,
+                 ref_enc_stride: int,
+                 n_gst_tokens: int,
+                 dropout_rate: float):
         super(UtteranceLevelProsodyEncoder, self).__init__()
 
-        self.E = model_config["transformer"]["encoder_hidden"]
-        self.d_q = self.d_k = model_config["transformer"]["encoder_hidden"]
-        ref_enc_gru_size = model_config["prosody_modeling"]["liu2021"]["ref_enc_gru_size"]
-        ref_attention_dropout = model_config["prosody_modeling"]["liu2021"]["ref_attention_dropout"]
-        bottleneck_size = model_config["prosody_modeling"]["liu2021"]["bottleneck_size_u"]
-
-        self.encoder = ReferenceEncoder(preprocess_config, model_config)
-        self.encoder_prj = nn.Linear(ref_enc_gru_size, self.E // 2)
-        self.stl = STL(preprocess_config, model_config)
-        self.encoder_bottleneck = nn.Linear(self.E, bottleneck_size)
-        self.dropout = nn.Dropout(ref_attention_dropout)
+        self.encoder = ReferenceEncoder(input_mel_channels,
+                                        ref_enc_filters,
+                                        ref_enc_kernel_size,
+                                        ref_enc_stride,
+                                        ref_enc_gru_size)
+        self.stl = STL(encoder_hidden_size, n_gst_tokens)
+        self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, mels, mel_mask):
         '''
@@ -560,11 +562,8 @@ class UtteranceLevelProsodyEncoder(nn.Module):
         '''
         _, embedded_prosody = self.encoder(mels, mel_mask)
 
-        # Bottleneck
-        embedded_prosody = self.encoder_prj(embedded_prosody)
-
         # Style Token
-        out = self.encoder_bottleneck(self.stl(embedded_prosody))
+        out = self.stl(embedded_prosody)
         out = self.dropout(out)
 
         return out
