@@ -748,6 +748,7 @@ class VarianceAdaptor(nn.Module):
     def __init__(self,
                  d_model: int,
                  multi_speaker: bool,
+                 use_utterance_level_prosody: bool,
                  predictor_n_layers: int,
                  predictor_n_int_channels: int,
                  predictor_kernel_size: int,
@@ -757,81 +758,118 @@ class VarianceAdaptor(nn.Module):
         super().__init__()
 
         self._multi_speaker = multi_speaker
+        self._use_utterance_level_prosody = use_utterance_level_prosody
 
-        self._spk_emb_enc = nn.Linear(spk_emb_dim, d_model)
-
-        self.duration_predictor = ProsodicFeaturesPredictor(
-            d_model,
-            n_chans=predictor_n_int_channels,
-            n_layers=predictor_n_layers,
-            dropout_rate=dropout_rate,
-            kernel_size=predictor_kernel_size)
-        
         self.length_regulator = LengthRegulator()
 
-        self._pitch_transform = nn.Sequential(
-            torch.nn.Conv1d(in_channels=1,
-                            out_channels=d_model,
-                            kernel_size=3,
-                            padding='same'),
-            nn.ReLU(),
-            torch.nn.Conv1d(in_channels=d_model,
-                            out_channels=d_model,
-                            kernel_size=3,
-                            padding='same'),
-            )
-
-        self._pitch_predictor = ProsodicFeaturesPredictor(
-            idim=d_model,
-            n_layers=predictor_n_layers,
-            n_chans=predictor_n_int_channels,
-            kernel_size=predictor_kernel_size,
-            dropout_rate=dropout_rate)
+        self.duration_predictor = ProsodicFeaturesPredictor(
+                d_model,
+                n_chans=predictor_n_int_channels,
+                n_layers=predictor_n_layers,
+                dropout_rate=dropout_rate,
+                kernel_size=predictor_kernel_size)
         
-        self._energy_transform = nn.Sequential(
-            torch.nn.Conv1d(in_channels=1,
-                            out_channels=d_model,
-                            kernel_size=3,
-                            padding='same'),
-            nn.ReLU(),
-            torch.nn.Conv1d(in_channels=d_model,
-                            out_channels=d_model,
-                            kernel_size=3,
-                            padding='same'),
-            )
+        self._spk_emb_enc = None
 
-        self.energy_predictor = ProsodicFeaturesPredictor(
-            idim=d_model,
-            n_layers=predictor_n_layers,
-            n_chans=predictor_n_int_channels,
-            kernel_size=predictor_kernel_size,
-            dropout_rate=dropout_rate)
+        if self._multi_speaker:
+            self._spk_emb_enc = nn.Linear(spk_emb_dim, d_model)
+
+        self._pitch_transform = None
+        self._pitch_predictor = None
+        self._energy_transform = None
+        self.energy_predictor = None
+        
+        if self._use_utterance_level_prosody:
+
+            self._pitch_transform = nn.Sequential(
+                torch.nn.Conv1d(in_channels=1,
+                                out_channels=d_model,
+                                kernel_size=3,
+                                padding='same'),
+                nn.ReLU(),
+                torch.nn.Conv1d(in_channels=d_model,
+                                out_channels=d_model,
+                                kernel_size=3,
+                                padding='same'),
+                )
+
+            self._pitch_predictor = ProsodicFeaturesPredictor(
+                idim=d_model,
+                n_layers=predictor_n_layers,
+                n_chans=predictor_n_int_channels,
+                kernel_size=predictor_kernel_size,
+                dropout_rate=dropout_rate)
+            
+            self._energy_transform = nn.Sequential(
+                torch.nn.Conv1d(in_channels=1,
+                                out_channels=d_model,
+                                kernel_size=3,
+                                padding='same'),
+                nn.ReLU(),
+                torch.nn.Conv1d(in_channels=d_model,
+                                out_channels=d_model,
+                                kernel_size=3,
+                                padding='same'),
+                )
+
+            self.energy_predictor = ProsodicFeaturesPredictor(
+                idim=d_model,
+                n_layers=predictor_n_layers,
+                n_chans=predictor_n_int_channels,
+                kernel_size=predictor_kernel_size,
+                dropout_rate=dropout_rate)
 
     def forward(
         self,
         phoneme_repr: torch.Tensor,
-        phoneme_lengths: torch.Tensor,
-        pitch_possible_values: torch.Tensor,
-        energy_possible_values: torch.Tensor,
-        speaker_embedding: Optional[torch.Tensor],
+        phonemes_length: torch.Tensor,
+
+        # Only if using utterance-level prosody
+        pitch_possible_values: Optional[torch.Tensor],
+        energy_possible_values: Optional[torch.Tensor],
+        # (training)
         pitch_target: Optional[torch.Tensor],
         energy_target: Optional[torch.Tensor],
-        explicit_duration: Optional[torch.Tensor]
-    ):
+
+        # Only if multi-speaker
+        speaker_embedding: Optional[torch.Tensor],
+
+        # (training)
+        explicit_durations: Optional[torch.Tensor]):
         
         model_output = {}
-        
-        train_only_inputs = (pitch_target, energy_target, explicit_duration)
+
+        if not self._multi_speaker:
+            assert speaker_embedding is None
+
+        else:
+            assert speaker_embedding is not None
+
+        train_only_inputs = [explicit_durations]
+
+        if not self._use_utterance_level_prosody:
+            assert all(el is None for el in (
+                pitch_possible_values,
+                energy_possible_values,
+                pitch_target,
+                energy_target,
+            ))
+
+        else:
+            assert all(el is not None for el in (
+                pitch_possible_values,
+                energy_possible_values,
+            ))
+
+            train_only_inputs.extend([pitch_target, energy_target])
         
         if any(el is None for el in train_only_inputs):
-        
             inference_mode = True
             assert all(el is None for el in train_only_inputs)    
         
         else:
             inference_mode = False
             assert all(el is not None for el in train_only_inputs)
-
 
         outputs = phoneme_repr
 
@@ -844,50 +882,50 @@ class VarianceAdaptor(nn.Module):
                 -1, phoneme_repr.shape[1], -1
             )
 
-        predicted_duration = self.duration_predictor(outputs.detach())
-        model_output['predicted_duration'] = predicted_duration
+        predicted_durations = self.duration_predictor(outputs.detach())
+        model_output['predicted_durations'] = predicted_durations
 
         if not inference_mode:
-            outputs, _ = self.length_regulator(outputs, explicit_duration, pitch_target.shape[1])
-            model_output['duration_rounded'] = explicit_duration
+            outputs, _ = self.length_regulator(outputs, explicit_durations, pitch_target.shape[1])
 
         else:
-            duration_rounded = torch.clamp(torch.round(predicted_duration), min=0)
-            duration_rounded *= mask_from_lengths(phoneme_lengths)
+            duration_rounded = torch.clamp(torch.round(predicted_durations), min=0)
+            duration_rounded *= mask_from_lengths(phonemes_length)
 
             mel_lengths = duration_rounded.sum(dim=1).long()
             outputs, _ = self.length_regulator(outputs,
                                                duration_rounded.long(),
                                                max_len=mel_lengths.max())
 
-        predicted_pitch = self._pitch_predictor(outputs.detach())
-        predicted_energy = self.energy_predictor(outputs.detach())
+        if self._use_utterance_level_prosody:
+            predicted_pitch = self._pitch_predictor(outputs.detach())
+            predicted_energy = self.energy_predictor(outputs.detach())
 
-        model_output['predicted_pitch'] = predicted_pitch
-        model_output['predicted_energy'] = predicted_energy
+            model_output['predicted_pitch'] = predicted_pitch
+            model_output['predicted_energy'] = predicted_energy
 
-        if not inference_mode:
-            chosen_pitch = pitch_target
-            chosen_energy = energy_target
+            if not inference_mode:
+                chosen_pitch = pitch_target
+                chosen_energy = energy_target
 
-        else:
-            chosen_pitch = predicted_pitch
-            chosen_energy = predicted_energy
+            else:
+                chosen_pitch = predicted_pitch
+                chosen_energy = predicted_energy
 
-        pitch_indices = torch.bucketize(chosen_pitch, pitch_possible_values)
-        energy_indices = torch.bucketize(chosen_energy, energy_possible_values)
+            pitch_indices = torch.bucketize(chosen_pitch, pitch_possible_values)
+            energy_indices = torch.bucketize(chosen_energy, energy_possible_values)
 
-        pitch_quant = pitch_possible_values[pitch_indices - 1]
-        energy_quant = energy_possible_values[energy_indices - 1]
+            pitch_quant = pitch_possible_values[pitch_indices - 1]
+            energy_quant = energy_possible_values[energy_indices - 1]
 
-        if not inference_mode:
-            model_output['target_pitch_quant'] = pitch_quant
-            model_output['target_energy_quant'] = energy_quant
+            if not inference_mode:
+                model_output['target_pitch_quant'] = pitch_quant
+                model_output['target_energy_quant'] = energy_quant
 
-        pitch_enc = self._pitch_transform(pitch_quant.unsqueeze(-1).transpose(1, 2))
-        energy_enc = self._energy_transform(energy_quant.unsqueeze(-1).transpose(1, 2))
+            pitch_enc = self._pitch_transform(pitch_quant.unsqueeze(-1).transpose(1, 2))
+            energy_enc = self._energy_transform(energy_quant.unsqueeze(-1).transpose(1, 2))
 
-        outputs = outputs + pitch_enc.transpose(1, 2) + energy_enc.transpose(1, 2)
+            outputs = outputs + pitch_enc.transpose(1, 2) + energy_enc.transpose(1, 2)
 
         model_output['output'] = outputs
 
