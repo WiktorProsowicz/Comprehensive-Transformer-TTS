@@ -332,9 +332,9 @@ class MultiHeadedSelfAttentionModule(nn.Module):
         super(MultiHeadedSelfAttentionModule, self).__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
-        self.positional_encoding = get_sinusoid_encoding_table(
+        self.positional_encoding =  torch.nn.Parameter(get_sinusoid_encoding_table(
             max_seq_len, d_model
-        )
+        ).unsqueeze(0), requires_grad=False)
         self.attention = RelativeMultiHeadAttention(d_model, num_heads, dropout_p)
         self.dropout = nn.Dropout(p=dropout_p)
 
@@ -436,7 +436,7 @@ class RelativeMultiHeadAttention(nn.Module):
 
         if query_mask is not None and key_mask is not None:
             mask = query_mask.unsqueeze(2) & key_mask.unsqueeze(1)
-            score.masked_fill_(mask, -1e9)
+            score.masked_fill_(mask.unsqueeze(1), -1e9)
 
         attn = F.softmax(score, -1)
         attn = self.dropout(attn)

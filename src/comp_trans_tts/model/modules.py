@@ -886,7 +886,10 @@ class VarianceAdaptor(nn.Module):
         model_output['predicted_durations'] = predicted_durations
 
         if not inference_mode:
-            outputs, _ = self.length_regulator(outputs, explicit_durations, pitch_target.shape[1])
+            mel_lengths = explicit_durations.sum(dim=1).long()
+            outputs, _ = self.length_regulator(outputs,
+                                               explicit_durations,
+                                               mel_lengths.max())
 
         else:
             duration_rounded = torch.clamp(torch.round(predicted_durations), min=0)
