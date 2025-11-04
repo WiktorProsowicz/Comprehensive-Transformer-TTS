@@ -334,12 +334,15 @@ class ReferenceEncoder(nn.Module):
     """ Reference Mel Encoder """
 
     def __init__(self,
+                 d_model: int,
                  n_mel_channels: int,
                  conv_filters: List[int],
                  conv_kernel_size: int,
-                 conv_stride: int,
+                 conv_stride: List[int],
+                 conv_padding: List[int],
                  gru_size: int,
                  dropout_rate: float):
+        
         super(ReferenceEncoder, self).__init__()
 
         self._dropout_rate = dropout_rate
@@ -350,12 +353,12 @@ class ReferenceEncoder(nn.Module):
                              out_channels=filters[0 + 1],
                              kernel_size=conv_kernel_size,
                              stride=conv_stride,
-                             padding='same', with_r=True)]
+                             padding=conv_padding, with_r=True)]
         convs2 = [nn.Conv2d(in_channels=filters[i],
                             out_channels=filters[i + 1],
                             kernel_size=conv_kernel_size,
                             stride=conv_stride,
-                            padding='same') for i in range(1, len(conv_filters))]
+                            padding=conv_padding) for i in range(1, len(conv_filters))]
         convs.extend(convs2)
         self.convs = nn.ModuleList(convs)
         self.bns = nn.ModuleList(
@@ -366,13 +369,21 @@ class ReferenceEncoder(nn.Module):
                           hidden_size=gru_size,
                           batch_first=True)
 
-    def forward(self, inputs, mask=None):
+        self._post_net = nn.Linear(gru_size, d_model)
+
+    def forward(self,
+                spectrogram,
+                spectrogram_length,
+                return_global: bool,
+                return_local: bool):
         """
-        inputs --- [N, Ty/r, n_mels*r]
-        outputs --- [N, E//2]
+        Args:
+            spectrogram: Input spectrogram (transposed). (B, T, n_mel_channels)
+            spectrogram_length: Length of the input spectrogram. (B,)
         """
-        N = inputs.size(0)
-        out = inputs.view(N, 1, -1, self.n_mel_channels)  # [N, 1, Ty, n_mels]
+
+        N = spectrogram.size(0)
+        out = spectrogram.view(N, 1, -1, self.n_mel_channels)  # [N, 1, Ty, n_mels]
         for conv, bn in zip(self.convs, self.bns):
             out = conv(out)
             out = bn(out)
@@ -383,13 +394,28 @@ class ReferenceEncoder(nn.Module):
         T = out.size(1)
         N = out.size(0)
         out = out.contiguous().view(N, T, -1)  # [N, Ty//2^K, 128*n_mels//2^K]
-        if mask is not None:
-            out = out.masked_fill(mask.unsqueeze(-1), 0)
+
+        packed_sequence = nn.utils.rnn.pack_padded_sequence(out,
+                                                            spectrogram_length.cpu(),
+                                                            batch_first=True,
+                                                            enforce_sorted=False)
 
         self.gru.flatten_parameters()
-        memory, out = self.gru(out)  # memory --- [N, Ty, E//2], out --- [1, N, E//2]
+        packed_output, global_ref_embedding = self.gru(packed_sequence)  # memory --- [N, Ty, E//2], out --- [1, N, E//2]
 
-        return memory, out.squeeze(0)
+        local_ref_embeddings, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
+
+        if return_global and return_local:
+            return (self._post_net(local_ref_embeddings),
+                    self._post_net(global_ref_embedding.squeeze(0)))
+
+        elif return_global:
+            return self._post_net(global_ref_embedding.squeeze(0))
+        
+        elif return_local:
+            return self._post_net(local_ref_embeddings)
+        
+        raise ValueError("At least one of return_global or return_local must be True.")
 
     def calculate_channels(self, L, kernel_size, stride, pad, n_convs):
         for i in range(n_convs):
@@ -460,33 +486,32 @@ class STL(nn.Module):
 
         self.embed = nn.Parameter(torch.FloatTensor(n_tokens, d_model))
         
-        self._input_ref_proj = nn.Linear(d_model, d_model // 2)
+        # self._input_ref_proj = nn.Linear(d_model, d_model // 2)
 
         self.attention = StyleEmbedAttention(
-            query_dim=d_model // 2, key_dim=d_model, num_units=d_model, num_heads=1)
+            query_dim=d_model, key_dim=d_model, num_units=d_model)
 
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
 
     def forward(self, encoded_reference: torch.Tensor):
         batch_size = encoded_reference.size(0)
-        query = self._input_ref_proj(encoded_reference).unsqueeze(1)  # [N, 1, E//2]
+        query = encoded_reference.unsqueeze(1)
 
         keys_soft = torch.tanh(self.embed).unsqueeze(0).expand(
             batch_size, -1, -1)  # [N, token_num, E // num_heads]
 
         # Weighted sum
-        emotion_embed_soft = self.attention(query, keys_soft)
+        embedding, embedding_weights = self.attention(query, keys_soft)
 
-        return emotion_embed_soft
+        return embedding, embedding_weights
 
 
 class StyleEmbedAttention(nn.Module):
     """ StyleEmbedAttention """
 
-    def __init__(self, query_dim, key_dim, num_units, num_heads):
+    def __init__(self, query_dim, key_dim, num_units):
         super(StyleEmbedAttention, self).__init__()
         self.num_units = num_units
-        self.num_heads = num_heads
         self.key_dim = key_dim
 
         self.W_query = nn.Linear(
@@ -505,32 +530,22 @@ class StyleEmbedAttention(nn.Module):
             out --- [N, T_q, num_units]
         """
         values = self.W_value(key_soft)
-        split_size = self.num_units // self.num_heads
-        values = torch.stack(torch.split(values, split_size, dim=2), dim=0)
 
         out_soft = scores_soft = None
         querys = self.W_query(query)  # [N, T_q, num_units]
         keys = self.W_key(key_soft)  # [N, T_k, num_units]
 
-        # [h, N, T_q, num_units/h]
-        querys = torch.stack(torch.split(querys, split_size, dim=2), dim=0)
-        # [h, N, T_k, num_units/h]
-        keys = torch.stack(torch.split(keys, split_size, dim=2), dim=0)
-        # [h, N, T_k, num_units/h]
-
         # score = softmax(QK^T / (d_k ** 0.5))
         scores_soft = torch.matmul(
-            querys, keys.transpose(2, 3))  # [h, N, T_q, T_k]
+            querys, keys.transpose(-2, -1))  # [h, N, T_q, T_k]
         scores_soft = scores_soft / (self.key_dim ** 0.5)
-        scores_soft = F.softmax(scores_soft, dim=3)
+        scores_soft = F.softmax(scores_soft, dim=-1)
 
         # out = score * V
         # [h, N, T_q, num_units/h]
         out_soft = torch.matmul(scores_soft, values)
-        out_soft = torch.cat(torch.split(out_soft, 1, dim=0), dim=3).squeeze(
-            0)  # [N, T_q, num_units]
 
-        return out_soft #, scores_soft
+        return out_soft.squeeze(-2), scores_soft.squeeze(-2)
 
 
 class UtteranceLevelProsodyEncoder(nn.Module):
@@ -542,31 +557,39 @@ class UtteranceLevelProsodyEncoder(nn.Module):
                  ref_enc_filters: List[int],
                  ref_enc_gru_size: int,
                  ref_enc_kernel_size: int,
-                 ref_enc_stride: int,
+                 ref_enc_stride: List[int],
+                 ref_enc_conv_padding: List[int],
                  n_gst_tokens: int,
                  dropout_rate: float):
         super(UtteranceLevelProsodyEncoder, self).__init__()
 
-        self.encoder = ReferenceEncoder(input_mel_channels,
+        self.encoder = ReferenceEncoder(encoder_hidden_size,
+                                        input_mel_channels,
                                         ref_enc_filters,
                                         ref_enc_kernel_size,
                                         ref_enc_stride,
-                                        ref_enc_gru_size)
+                                        ref_enc_conv_padding,
+                                        ref_enc_gru_size,
+                                        dropout_rate)
         self.stl = STL(encoder_hidden_size, n_gst_tokens)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, mels, mel_mask):
-        '''
-        mels --- [N, Ty/r, n_mels*r], r=1
-        out --- [N, seq_len, E]
-        '''
-        _, embedded_prosody = self.encoder(mels, mel_mask)
+    def forward(self, spectrogram, spectrogram_length):
+        """Encodes input spectrogram into GST-based style embedding.
+        
+        Args:
+            spectrogram: Input spectrogram. (B, n_mel_channels, T)
+            spectrogram_length: Lengths of the input spectrogram. (B,)
+        """
 
-        # Style Token
-        out = self.stl(embedded_prosody)
-        out = self.dropout(out)
+        ref_emb_global = self.encoder(spectrogram.transpose(1, 2),
+                                      spectrogram_length,
+                                      return_global=True,
+                                      return_local=False)
 
-        return out
+        gst_embedding, gst_weights = self.stl(ref_emb_global)
+
+        return self.dropout(gst_embedding), gst_weights
 
 
 class ParallelProsodyPredictor(nn.Module):
