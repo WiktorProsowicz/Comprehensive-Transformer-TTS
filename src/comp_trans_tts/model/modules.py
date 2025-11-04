@@ -1078,7 +1078,7 @@ class LengthRegulator(nn.Module):
         output = list()
         mel_len = list()
         for batch, expand_target in zip(x, duration):
-            expanded = self.expand(batch, expand_target)
+            expanded = torch.repeat_interleave(batch, expand_target, dim=0)
             output.append(expanded)
             mel_len.append(expanded.shape[0])
 
@@ -1088,16 +1088,6 @@ class LengthRegulator(nn.Module):
             output = pad(output)
 
         return output, torch.LongTensor(mel_len).to(x.device)
-
-    def expand(self, batch, predicted):
-        out = list()
-
-        for i, vec in enumerate(batch):
-            expand_size = predicted[i].item()
-            out.append(vec.expand(max(int(expand_size), 0), -1))
-        out = torch.cat(out, 0)
-
-        return out
 
     def forward(self, x, duration, max_len):
         output, mel_len = self.LR(x, duration, max_len)
