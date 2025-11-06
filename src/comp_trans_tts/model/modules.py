@@ -4,6 +4,7 @@ import copy
 import math
 from collections import OrderedDict
 from typing import Optional, List
+import dataclasses
 
 import torch
 import torch.nn as nn
@@ -75,6 +76,15 @@ def b_mas(b_attn_map, in_lens, out_lens, width=1):
         attn_out[b, 0, : out_lens[b], : in_lens[b]] = out
     return attn_out
 
+@dataclasses.dataclass
+class LingAwareEncoderCfg:
+    """Configuration for Linguistic Aware Encoder"""
+
+    phonemes_vocab_size: int
+    d_model: int
+    linguistic_features_dim: int
+    dropout_rate: float
+
 class _LinguisticAwareEncoder(nn.Module):
     """Encodes phonemes and linguistic information.
     
@@ -82,25 +92,22 @@ class _LinguisticAwareEncoder(nn.Module):
     """
 
     def __init__(self,
-                 phonemes_vocab_size: int,
-                 hidden_size: int,
-                 linguistic_features_dim: int,
-                 dropout_rate: float):
+                 cfg: LingAwareEncoderCfg):
         
         super().__init__()
 
         self._phoneme_encoder = torch.nn.Sequential(
-            torch.nn.Embedding(phonemes_vocab_size, hidden_size),
+            torch.nn.Embedding(cfg.phonemes_vocab_size, cfg.d_model),
             torch.nn.SiLU(),
-            torch.nn.LayerNorm(hidden_size),
-            torch.nn.Dropout(dropout_rate)
+            torch.nn.LayerNorm(cfg.d_model),
+            torch.nn.Dropout(cfg.dropout_rate)
         )
 
         self._ling_info_encoder = torch.nn.Sequential(
-            torch.nn.Linear(linguistic_features_dim, hidden_size),
+            torch.nn.Linear(cfg.linguistic_features_dim, cfg.d_model),
             torch.nn.SiLU(),
-            torch.nn.LayerNorm(hidden_size),
-            torch.nn.Dropout(dropout_rate)
+            torch.nn.LayerNorm(cfg.d_model),
+            torch.nn.Dropout(cfg.dropout_rate)
         )
 
     def forward(self,
@@ -117,71 +124,67 @@ class _LinguisticAwareEncoder(nn.Module):
 
         return output[torch.arange(bsize).unsqueeze(1), phoneme_to_spec_indices]
 
+@dataclasses.dataclass
+class ReferenceEncoderCfg:
+    """Configuration for Reference Encoder"""
+
+    d_model: int
+    n_mel_channels: int
+    conv_filters: List[int]
+    conv_kernel_size: int
+    conv_stride: List[int]
+    conv_padding: List[int]
+    gru_size: int
+    dropout_rate: float
 
 class _ReferenceEncoder(nn.Module):
     """ Reference Mel Encoder """
 
     def __init__(self,
-                 d_model: int,
-                 n_mel_channels: int,
-                 conv_filters: List[int],
-                 conv_kernel_size: int,
-                 conv_stride: List[int],
-                 conv_padding: List[int],
-                 gru_size: int,
-                 dropout_rate: float,
+                 cfg: ReferenceEncoderCfg,
                  linguistic_aware_encoder: Optional[_LinguisticAwareEncoder]):
         """
         Args:
-            d_model: Hidden size of the model.
-            n_mel_channels: Number of mel channels.
-            conv_filters: Number of filters for each conv layer.
-            conv_kernel_size: Kernel size for conv layers.
-            conv_stride: Stride size for conv layers. E.g. [1, 2] to preserve time resolution.
-            conv_padding: Padding size for conv layers.
-            gru_size: Hidden size of the GRU layer. Determines the size of the bottleneck.
-            dropout_rate: Dropout rate for conv layers.
+            cfg: Configuration for the reference encoder.
             linguistic_aware_encoder: Encoder for linguistic information to enhance the reference encoder.
         """
         
         super().__init__()
 
-        self._dropout_rate = dropout_rate
-        self.n_mel_channels = n_mel_channels
-        filters = [1] + conv_filters
+        self._dropout_rate = cfg.dropout_rate
+        self.n_mel_channels = cfg.n_mel_channels
+        filters = [1] + cfg.conv_filters
         # Use CoordConv at the first layer to better preserve positional information: https://arxiv.org/pdf/1811.02122.pdf
         convs = [CoordConv2d(in_channels=filters[0],
                              out_channels=filters[0 + 1],
-                             kernel_size=conv_kernel_size,
-                             stride=conv_stride,
-                             padding=conv_padding, with_r=True)]
+                             kernel_size=cfg.conv_kernel_size,
+                             stride=cfg.conv_stride,
+                             padding=cfg.conv_padding, with_r=True)]
         convs2 = [nn.Conv2d(in_channels=filters[i],
                             out_channels=filters[i + 1],
-                            kernel_size=conv_kernel_size,
-                            stride=conv_stride,
-                            padding=conv_padding) for i in range(1, len(conv_filters))]
+                            kernel_size=cfg.conv_kernel_size,
+                            stride=cfg.conv_stride,
+                            padding=cfg.conv_padding) for i in range(1, len(cfg.conv_filters))]
         convs.extend(convs2)
         self.convs = nn.ModuleList(convs)
         self.bns = nn.ModuleList(
-            [nn.BatchNorm2d(num_features=n_filters) for n_filters in conv_filters])
+            [nn.BatchNorm2d(num_features=n_filters) for n_filters in cfg.conv_filters])
 
-        out_channels = self.calculate_channels(n_mel_channels, 3, 2, 1, len(conv_filters))
-        
-        self._conv_postnet = torch.nn.Linear(conv_filters[-1] * out_channels, d_model)
-        
-        self.gru = nn.GRU(input_size=d_model,
-                          hidden_size=gru_size,
+        out_channels = self.calculate_channels(cfg.n_mel_channels, 3, 2, 1, len(cfg.conv_filters))
+
+        self._conv_postnet = torch.nn.Linear(cfg.conv_filters[-1] * out_channels, cfg.d_model)
+
+        self.gru = nn.GRU(input_size=cfg.d_model,
+                          hidden_size=cfg.gru_size,
                           batch_first=True)
 
-        self._post_net = nn.Linear(gru_size, d_model)
+        self._post_net = nn.Linear(cfg.gru_size, cfg.d_model)
 
         self._ling_aware_encoder = linguistic_aware_encoder
 
     def forward(self,
                 spectrogram,
                 spectrogram_length,
-                return_global: bool,
-                return_local: bool,
                 phoneme_ids: Optional[torch.Tensor],
                 linguistic_features: Optional[torch.Tensor],
                 phoneme_to_spec_indices: Optional[torch.Tensor]):
@@ -206,9 +209,6 @@ class _ReferenceEncoder(nn.Module):
         out = self._conv_postnet(out)
 
         if self._ling_aware_encoder is not None:
-            assert phoneme_ids is not None
-            assert linguistic_features is not None
-            assert phoneme_to_spec_indices is not None
 
             encoded_ling_info = self._ling_aware_encoder(
                 phoneme_ids,
@@ -228,37 +228,35 @@ class _ReferenceEncoder(nn.Module):
 
         local_ref_embeddings, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
 
-        if return_global and return_local:
-            return (self._post_net(local_ref_embeddings),
-                    self._post_net(global_ref_embedding.squeeze(0)))
+        return (self._post_net(local_ref_embeddings),
+                self._post_net(global_ref_embedding.squeeze(0)))
 
-        elif return_global:
-            return self._post_net(global_ref_embedding.squeeze(0))
         
-        elif return_local:
-            return self._post_net(local_ref_embeddings)
-        
-        raise ValueError("At least one of return_global or return_local must be True.")
-
     def calculate_channels(self, L, kernel_size, stride, pad, n_convs):
         for i in range(n_convs):
             L = (L - kernel_size + 2 * pad) // stride + 1
         return L
 
+@dataclasses.dataclass
+class STLConfig:
+    """Configuration for Style Token Layer"""
+
+    d_model: int
+    n_tokens: int
+
 class _STL(nn.Module):
     """ Style Token Layer """
 
     def __init__(self,
-                 d_model: int,
-                 n_tokens: int):
+                 cfg: STLConfig):
         super().__init__()
 
-        self.embed = nn.Parameter(torch.FloatTensor(n_tokens, d_model))
-        
+        self.embed = nn.Parameter(torch.FloatTensor(cfg.n_tokens, cfg.d_model))
+
         # self._input_ref_proj = nn.Linear(d_model, d_model // 2)
 
         self.attention = _StyleEmbedAttention(
-            query_dim=d_model, key_dim=d_model, num_units=d_model)
+            query_dim=cfg.d_model, key_dim=cfg.d_model, num_units=cfg.d_model)
 
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
 
@@ -316,52 +314,73 @@ class _StyleEmbedAttention(nn.Module):
 
         return out_soft.squeeze(-2), scores_soft.squeeze(-2)
 
-
-class UtteranceLevelProsodyEncoder(nn.Module):
-    """ Utterance-level Prosody Encoder """
+class _ProsodyEncoderBase(nn.Module):
+    """Encodes reference mel-spectrogram into style embeddings."""
 
     def __init__(self,
-                 encoder_hidden_size: int,
-                 input_mel_channels: int,
-                 ref_enc_filters: List[int],
-                 ref_enc_gru_size: int,
-                 ref_enc_kernel_size: int,
-                 ref_enc_stride: List[int],
-                 ref_enc_conv_padding: List[int],
-                 n_gst_tokens: int,
-                 dropout_rate: float,
-                 linguistic_aware: bool,
-                 phonemes_vocab_size: int,
-                 linguistic_features_dim: int):
-        super(UtteranceLevelProsodyEncoder, self).__init__()
+                 ref_encoder_cfg: ReferenceEncoderCfg,
+                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
+        
+        super().__init__()
 
         linguistic_aware_encoder = None
+        self._is_linguistic_aware = False
 
-        if linguistic_aware:
-            linguistic_aware_encoder = _LinguisticAwareEncoder(
-                phonemes_vocab_size=phonemes_vocab_size,
-                hidden_size=encoder_hidden_size,
-                linguistic_features_dim=linguistic_features_dim,
-                dropout_rate=dropout_rate
-            )
+        if ling_aware_cfg is not None:
+            linguistic_aware_encoder = _LinguisticAwareEncoder(ling_aware_cfg)
+            self._is_linguistic_aware = True
 
-        self.encoder = _ReferenceEncoder(encoder_hidden_size,
-                                        input_mel_channels,
-                                        ref_enc_filters,
-                                        ref_enc_kernel_size,
-                                        ref_enc_stride,
-                                        ref_enc_conv_padding,
-                                        ref_enc_gru_size,
-                                        dropout_rate,
+        self._encoder = _ReferenceEncoder(ref_encoder_cfg,
                                         linguistic_aware_encoder)
-        self.stl = _STL(encoder_hidden_size, n_gst_tokens)
-        self.dropout = nn.Dropout(dropout_rate)
 
     @property
     def is_linguistic_aware(self) -> bool:
-        return self.encoder._ling_aware_encoder is not None
+        return self._is_linguistic_aware
 
-    def forward(self, 
+    def encode_reference(self, 
+                spectrogram: torch.Tensor,
+                spectrogram_length: torch.Tensor,
+
+                phoneme_ids: Optional[torch.Tensor],
+                linguistic_features: Optional[torch.Tensor],
+                phoneme_spec_indices: Optional[torch.Tensor]):
+
+        if self._is_linguistic_aware:
+            assert phoneme_ids is not None
+            assert linguistic_features is not None
+            assert phoneme_spec_indices is not None
+
+        else:
+            assert phoneme_ids is None
+            assert linguistic_features is None
+            assert phoneme_spec_indices is None
+
+        return self._encoder(spectrogram.transpose(1, 2),
+                                      spectrogram_length,
+                                      phoneme_ids=phoneme_ids,
+                                      linguistic_features=linguistic_features,
+                                      phoneme_to_spec_indices=phoneme_spec_indices)
+    
+
+class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
+    """Encodes reference mel-spectrogram into utterance-level prosody embeddings.
+    
+    This approach was inspired by:
+        "Style Tokens: Unsupervised Style Modeling, Control and Transfer in End-to-End
+        Speech Synthesis" by Yuxuan Wang et al.
+    """
+
+    def __init__(self,
+                 ref_encoder_cfg: ReferenceEncoderCfg,
+                 stl_cfg: STLConfig,
+                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
+        
+        super().__init__(ref_encoder_cfg, ling_aware_cfg)
+
+        self._stl = _STL(stl_cfg)
+        
+        
+    def forward(self,
                 spectrogram: torch.Tensor,
                 spectrogram_length: torch.Tensor,
 
@@ -373,19 +392,25 @@ class UtteranceLevelProsodyEncoder(nn.Module):
         Args:
             spectrogram: Input spectrogram. (B, n_mel_channels, T)
             spectrogram_length: Lengths of the input spectrogram. (B,)
+            phoneme_ids: Phoneme IDs corresponding to the spectrogram. (B, T_text)
+            linguistic_features: Linguistic features corresponding to the spectrogram.
+                (B, T_text, ling_feat_dim)
+            phoneme_spec_indices: Mapping from spectrogram frames to phoneme indices. (B, T_spec)
+
+        Returns:
+            For each style token layer, returns the corresponding style embedding and
+                attention weights.
         """
+        
+        _, global_ref_embedding = super().encode_reference(spectrogram,
+                                                            spectrogram_length,
+                                                            phoneme_ids,
+                                                            linguistic_features,
+                                                            phoneme_spec_indices)
 
-        ref_emb_global = self.encoder(spectrogram.transpose(1, 2),
-                                      spectrogram_length,
-                                      return_global=True,
-                                      return_local=False,
-                                      phoneme_ids=phoneme_ids,
-                                      linguistic_features=linguistic_features,
-                                      phoneme_to_spec_indices=phoneme_spec_indices)
+        return self._stl(global_ref_embedding)
 
-        gst_embedding, gst_weights = self.stl(ref_emb_global)
 
-        return self.dropout(gst_embedding), gst_weights
     
 
 @torch.no_grad()
