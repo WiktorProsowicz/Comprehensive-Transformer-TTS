@@ -261,11 +261,18 @@ class _STL(nn.Module):
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
 
     def forward(self, encoded_reference: torch.Tensor):
-        batch_size = encoded_reference.size(0)
-        query = encoded_reference.unsqueeze(1)
+        query = encoded_reference.unsqueeze(-2)
 
-        keys_soft = torch.tanh(self.embed).unsqueeze(0).expand(
-            batch_size, -1, -1)  # [N, token_num, E // num_heads]
+        keys_soft = torch.tanh(self.embed)
+
+        if encoded_reference.ndim == 3:
+            keys_soft = keys_soft.unsqueeze(0).unsqueeze(0)
+            keys_soft = keys_soft.expand(encoded_reference.size(0), encoded_reference.size(1), -1, -1)
+
+        else:
+            keys_soft = keys_soft.unsqueeze(0)
+            keys_soft = keys_soft.expand(encoded_reference.size(0), -1, -1)
+
 
         # Weighted sum
         embedding, embedding_weights = self.attention(query, keys_soft)
@@ -384,9 +391,9 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
                 spectrogram: torch.Tensor,
                 spectrogram_length: torch.Tensor,
 
-                phoneme_ids: Optional[torch.Tensor],
-                linguistic_features: Optional[torch.Tensor],
-                phoneme_spec_indices: Optional[torch.Tensor]):
+                phoneme_ids: Optional[torch.Tensor] = None,
+                linguistic_features: Optional[torch.Tensor] = None,
+                phoneme_spec_indices: Optional[torch.Tensor] = None):
         """Encodes input spectrogram into GST-based style embedding.
         
         Args:
