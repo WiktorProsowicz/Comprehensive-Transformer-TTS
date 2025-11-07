@@ -466,7 +466,55 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
         
         return self._stl(word_level_embeddings)
     
-    
+class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
+    """Encodes input spectrogram into both utterance-level and word-level prosody embeddings.
+
+    The module uses a single encoder for both levels of prosody embeddings.
+    """
+
+    def __init__(self,
+                 ref_encoder_cfg: ReferenceEncoderCfg,
+                 global_stl_cfg: STLConfig,
+                 local_stl_cfg: STLConfig,
+                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
+        
+        super().__init__(ref_encoder_cfg, ling_aware_cfg)
+
+        self._global_stl = _STL(global_stl_cfg)
+        self._local_stl = _STL(local_stl_cfg)
+
+    def forward(self,
+                spectrogram: torch.Tensor,
+                spectrogram_length: torch.Tensor,
+                spec_word_pool_matrix: torch.Tensor,
+
+                phoneme_ids: Optional[torch.Tensor] = None,
+                linguistic_features: Optional[torch.Tensor] = None,
+                phoneme_spec_indices: Optional[torch.Tensor] = None):
+        """Encodes input spectrogram into both utterance-level and word-level prosody embeddings.
+        
+        Args:
+            spectrogram: Input spectrogram. (B, n_mel_channels, T)
+            spectrogram_length: Lengths of the input spectrogram. (B,)
+            spec_word_pool_matrix: Pooling matrix to aggregate spectrogram-level
+                embeddings into word-level embeddings. (B, T_spec, T_words)
+            phoneme_ids: Phoneme IDs corresponding to the spectrogram. (B, T_text)
+            linguistic_features: Linguistic features corresponding to the spectrogram.
+                (B, T_text, ling_feat_dim)
+            phoneme_spec_indices: Mapping from spectrogram frames to phoneme indices. (B, T_spec)
+        """
+
+        local_ref_embeddings, global_ref_embedding = super().encode_reference(spectrogram,
+                                         spectrogram_length,
+                                         phoneme_ids,
+                                         linguistic_features,
+                                         phoneme_spec_indices)
+
+        word_level_embeddings = torch.bmm(spec_word_pool_matrix.transpose(-1, -2),
+                                            local_ref_embeddings)
+
+        return (self._global_stl(global_ref_embedding),
+                self._local_stl(word_level_embeddings))
 
 @torch.no_grad()
 def mask_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
