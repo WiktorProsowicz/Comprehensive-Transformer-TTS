@@ -244,6 +244,13 @@ class STLConfig:
     d_model: int
     n_tokens: int
 
+@dataclasses.dataclass
+class StlBinarizationParams:
+    """Parameters for binarization of STL attention weights."""
+    
+    hard: bool
+    gumbel_temperature: float
+
 class _STL(nn.Module):
     """ Style Token Layer """
 
@@ -260,7 +267,9 @@ class _STL(nn.Module):
 
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
 
-    def forward(self, encoded_reference: torch.Tensor):
+    def forward(self,
+                encoded_reference: torch.Tensor,
+                binarization_params: Optional[StlBinarizationParams]):
         query = encoded_reference.unsqueeze(-2)
 
         keys_soft = torch.tanh(self.embed)
@@ -275,7 +284,7 @@ class _STL(nn.Module):
 
 
         # Weighted sum
-        embedding, embedding_weights = self.attention(query, keys_soft)
+        embedding, embedding_weights = self.attention(query, keys_soft, binarization_params)
 
         return embedding, embedding_weights
 
@@ -295,7 +304,7 @@ class _StyleEmbedAttention(nn.Module):
         self.W_value = nn.Linear(
             in_features=key_dim, out_features=num_units, bias=False)
 
-    def forward(self, query, key_soft):
+    def forward(self, query, key_soft, binarization_params: Optional[StlBinarizationParams]):
         """
         input:
             query --- [N, T_q, query_dim]
@@ -313,13 +322,21 @@ class _StyleEmbedAttention(nn.Module):
         scores_soft = torch.matmul(
             querys, keys.transpose(-2, -1))  # [h, N, T_q, T_k]
         scores_soft = scores_soft / (self.key_dim ** 0.5)
-        scores_soft = F.softmax(scores_soft, dim=-1)
+
+        if binarization_params is None:
+            weights = F.softmax(scores_soft, dim=-1)
+        
+        else:
+            weights = F.gumbel_softmax(logits=scores_soft,
+                                       tau=binarization_params.gumbel_temperature,
+                                       hard=binarization_params.hard,
+                                       dim=-1)
 
         # out = score * V
         # [h, N, T_q, num_units/h]
-        out_soft = torch.matmul(scores_soft, values)
+        out_soft = torch.matmul(weights, values)
 
-        return out_soft.squeeze(-2), scores_soft.squeeze(-2)
+        return out_soft.squeeze(-2), weights.squeeze(-2)
 
 class _ProsodyEncoderBase(nn.Module):
     """Encodes reference mel-spectrogram into style embeddings."""
@@ -393,7 +410,8 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
 
                 phoneme_ids: Optional[torch.Tensor] = None,
                 linguistic_features: Optional[torch.Tensor] = None,
-                phoneme_spec_indices: Optional[torch.Tensor] = None):
+                phoneme_spec_indices: Optional[torch.Tensor] = None,
+                stl_binarization_params: Optional[StlBinarizationParams] = None):
         """Encodes input spectrogram into GST-based style embedding.
         
         Args:
@@ -403,6 +421,7 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
             linguistic_features: Linguistic features corresponding to the spectrogram.
                 (B, T_text, ling_feat_dim)
             phoneme_spec_indices: Mapping from spectrogram frames to phoneme indices. (B, T_spec)
+            stl_binarization_params: Parameters for binarization of STL attention weights.
 
         Returns:
             For each style token layer, returns the corresponding style embedding and
@@ -415,7 +434,7 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
                                                             linguistic_features,
                                                             phoneme_spec_indices)
 
-        return self._stl(global_ref_embedding)
+        return self._stl(global_ref_embedding, stl_binarization_params)
 
 class WordLevelProsodyEncoder(_ProsodyEncoderBase):
     """Encodes reference mel-spectrogram into word-level prosody embeddings.
@@ -441,7 +460,8 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
 
                 phoneme_ids: Optional[torch.Tensor] = None,
                 linguistic_features: Optional[torch.Tensor] = None,
-                phoneme_spec_indices: Optional[torch.Tensor] = None):
+                phoneme_spec_indices: Optional[torch.Tensor] = None,
+                stl_binarization_params: Optional[StlBinarizationParams] = None):
         """Encodes input spectrogram into GST-based style embeddings for each word.
         
         Args:
@@ -453,6 +473,7 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
             linguistic_features: Linguistic features corresponding to the spectrogram.
                 (B, T_text, ling_feat_dim)
             phoneme_spec_indices: Mapping from spectrogram frames to phoneme indices. (B, T_spec)
+            stl_binarization_params: Parameters for binarization of STL attention weights.
         """
 
         local_ref_embeddings, _ = super().encode_reference(spectrogram,
@@ -464,7 +485,7 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
         word_level_embeddings = torch.bmm(spec_word_pool_matrix.transpose(-1, -2),
                                             local_ref_embeddings)
         
-        return self._stl(word_level_embeddings)
+        return self._stl(word_level_embeddings, stl_binarization_params)
     
 class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
     """Encodes input spectrogram into both utterance-level and word-level prosody embeddings.
@@ -490,7 +511,9 @@ class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
 
                 phoneme_ids: Optional[torch.Tensor] = None,
                 linguistic_features: Optional[torch.Tensor] = None,
-                phoneme_spec_indices: Optional[torch.Tensor] = None):
+                phoneme_spec_indices: Optional[torch.Tensor] = None,
+                global_stl_binarization_params: Optional[StlBinarizationParams] = None,
+                local_stl_binarization_params: Optional[StlBinarizationParams] = None):
         """Encodes input spectrogram into both utterance-level and word-level prosody embeddings.
         
         Args:
@@ -513,8 +536,8 @@ class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
         word_level_embeddings = torch.bmm(spec_word_pool_matrix.transpose(-1, -2),
                                             local_ref_embeddings)
 
-        return (self._global_stl(global_ref_embedding),
-                self._local_stl(word_level_embeddings))
+        return (self._global_stl(global_ref_embedding, global_stl_binarization_params),
+                self._local_stl(word_level_embeddings, local_stl_binarization_params))
 
 @torch.no_grad()
 def mask_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
