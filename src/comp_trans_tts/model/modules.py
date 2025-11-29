@@ -249,7 +249,7 @@ class StlBinarizationParams:
     """Parameters for binarization of STL attention weights."""
     
     hard: bool
-    gumbel_temperature: float
+    temperature: float
 
 class _STL(nn.Module):
     """ Style Token Layer """
@@ -288,6 +288,18 @@ class _STL(nn.Module):
 
         return embedding, embedding_weights
 
+def binarized_softmax(logits: torch.Tensor, tau: float=1.0, hard: bool=False, dim: int=-1):
+
+    y_soft = torch.nn.functional.softmax(logits / tau, dim=dim)    
+    
+    if hard:
+        y_hard = torch.nn.functional.one_hot(y_soft.argmax(dim=dim), y_soft.shape[dim]).float()
+
+        y = y_hard - y_soft.detach() + y_soft
+    else:
+        y = y_soft
+    
+    return y
 
 class _StyleEmbedAttention(nn.Module):
     """ StyleEmbedAttention """
@@ -327,10 +339,10 @@ class _StyleEmbedAttention(nn.Module):
             weights = F.softmax(scores_soft, dim=-1)
         
         else:
-            weights = F.gumbel_softmax(logits=scores_soft,
-                                       tau=binarization_params.gumbel_temperature,
-                                       hard=binarization_params.hard,
-                                       dim=-1)
+            weights = binarized_softmax(scores_soft,
+                                        tau=binarization_params.temperature,
+                                        hard=binarization_params.hard,
+                                        dim=-1)
 
         # out = score * V
         # [h, N, T_q, num_units/h]
