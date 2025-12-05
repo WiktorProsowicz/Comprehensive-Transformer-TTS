@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -384,3 +386,44 @@ class BinLoss(nn.Module):
     def forward(self, hard_attention, soft_attention):
         log_sum = torch.log(torch.clamp(soft_attention[hard_attention == 1], min=1e-12)).sum()
         return -log_sum / hard_attention.sum()
+
+
+def gst_diversity_loss(gst_weights: torch.Tensor,
+                          wsv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Args:
+        gst_weights: [B, num_tokens] or [B, sequence_length, num_tokens]
+        wsv_mask: Optional mask tensor of shape [B, sequence_length] where 1 indicates
+        non-padding elements. Only for the 3D case.
+    """
+
+    EPS = 1e-12
+
+    n_tokens = gst_weights.size(-1)
+
+    if wsv_mask is None or gst_weights.dim() == 2:
+        marg = gst_weights.reshape(-1, n_tokens).mean(dim=0)
+    
+    else:
+        marg = (gst_weights * wsv_mask.unsqueeze(-1)).sum(dim=(0, 1)) / (wsv_mask.sum())
+
+    uniform = torch.full_like(marg, 1.0 / n_tokens)
+    return (marg * ((marg + EPS).log() - (uniform + EPS).log())).sum() 
+
+
+def gst_entropy_loss(gst_weights: torch.Tensor,
+                 wsv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Args:
+        gst_weights: [B, num_tokens] or [B, sequence_length, num_tokens]
+        wsv_mask: Optional mask tensor of shape [B, sequence_length] where 1 indicates
+        non-padding elements. Only for the 3D case.
+    """
+
+    EPS = 1e-12
+
+    n_tokens = gst_weights.size(-1)
+    entropy = -(gst_weights * (gst_weights + EPS).log()).sum(dim=-1)  # [B, T] or [B]
+
+    if wsv_mask is None or gst_weights.dim() == 2:
+        return entropy.mean()
+
+    return (entropy * wsv_mask).sum() / (wsv_mask.sum() * n_tokens)
