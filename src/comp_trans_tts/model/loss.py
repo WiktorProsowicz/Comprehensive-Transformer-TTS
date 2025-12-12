@@ -464,6 +464,7 @@ def gst_mean_top_weight(gst_weights: torch.Tensor,
     """
 
     top_weight, _ = gst_weights.max(dim=-1)
+    top_weight = top_weight.squeeze(-1)
 
     if wsv_mask is None or gst_weights.dim() == 2:
         return top_weight.mean()
