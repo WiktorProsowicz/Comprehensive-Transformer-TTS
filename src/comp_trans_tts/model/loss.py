@@ -427,3 +427,68 @@ def gst_entropy_loss(gst_weights: torch.Tensor,
         return entropy.mean()
 
     return (entropy * wsv_mask).sum() / (wsv_mask.sum() * n_tokens)
+
+def gst_distance_from_uniform(gst_weights: torch.Tensor,
+              wsv_mask=None) -> torch.Tensor:
+    """Returns metric indicating how far the GST weights are from uniform distribution.
+
+    In practice the distance is calculated as mean 1 - Gini coefficient across the batch.
+    The coefficient is scaled so that the value for uniform distribution is 1.
+
+    Args:
+        gst_weights: [B, num_tokens] or [B, sequence_length, num_tokens]
+        wsv_mask: Optional mask tensor of shape [B, sequence_length] where 1 indicates
+        non-padding elements. Only for the 3D case.
+    """
+
+    max_value = 1.0 - 1.0 / gst_weights.size(-1)
+    gini_vals = (1.0 - (gst_weights**2).sum(-1)) / max_value
+    distances = 1.0 - gini_vals
+
+    if gst_weights.dim() == 2:
+        return distances.mean()
+
+    if wsv_mask is None or gst_weights.dim() == 2:
+        return distances.mean()
+
+    return (distances * wsv_mask).sum() / wsv_mask.sum()
+
+def gst_mean_top_weight(gst_weights: torch.Tensor,
+                         wsv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Returns average value of the highest GST weight across the batch.
+    
+    Args:
+        gst_weights: [B, num_tokens] or [B, sequence_length, num_tokens]
+        wsv_mask: Optional mask tensor of shape [B, sequence_length] where 1 indicates
+        non-padding elements. Only for the 3D case.
+    """
+
+    top_weight, _ = gst_weights.max(dim=-1)
+
+    if wsv_mask is None or gst_weights.dim() == 2:
+        return top_weight.mean()
+
+    return (top_weight * wsv_mask).sum() / wsv_mask.sum()
+
+def gst_top_k_mass(gst_weights: torch.Tensor,
+                   k: int,
+                    wsv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Returns total probability mass concentrated in the top k tokens.
+
+    The masses are averaged across all batch elements.
+    
+    Args:
+        gst_weights: [B, num_tokens] or [B, sequence_length, num_tokens]
+        k: The number of top tokens to choose.
+        wsv_mask: Optional mask tensor of shape [B, sequence_length] where 1 indicates
+        non-padding elements. Only for the 3D case.
+    """
+
+    sorted_weights, _ = torch.sort(gst_weights, dim=-1, descending=True)
+
+    prob_mass = sorted_weights[..., :k].sum(dim=-1)
+
+    if wsv_mask is None or gst_weights.dim() == 2:
+        return prob_mass.mean()
+    
+    return (prob_mass * wsv_mask).sum() / wsv_mask.sum()
