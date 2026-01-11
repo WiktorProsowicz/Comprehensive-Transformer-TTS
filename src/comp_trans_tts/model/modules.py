@@ -293,13 +293,9 @@ def binarized_softmax(logits: torch.Tensor, tau: float=1.0, hard: bool=False, di
     y_soft = torch.nn.functional.softmax(logits / tau, dim=dim)    
     
     if hard:
-        y_hard = torch.nn.functional.one_hot(y_soft.argmax(dim=dim), y_soft.shape[dim]).float()
-
-        y = y_hard - y_soft.detach() + y_soft
-    else:
-        y = y_soft
-    
-    return y
+        return torch.nn.functional.one_hot(y_soft.argmax(dim=dim), y_soft.shape[dim]).float()
+        
+    return y_soft
 
 class _StyleEmbedAttention(nn.Module):
     """ StyleEmbedAttention """
