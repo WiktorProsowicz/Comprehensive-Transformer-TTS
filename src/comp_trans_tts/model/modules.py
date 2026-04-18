@@ -11,6 +11,7 @@ import torch.nn as nn
 from numba import jit, prange
 import numpy as np
 import torch.nn.functional as F
+import pydantic
 
 from comp_trans_tts.utils.tools import (
     get_variance_level,
@@ -77,7 +78,7 @@ def b_mas(b_attn_map, in_lens, out_lens, width=1):
     return attn_out
 
 @dataclasses.dataclass
-class LingAwareEncoderCfg:
+class LingAwareEncoderCfg(pydantic.BaseModel):
     """Configuration for Linguistic Aware Encoder"""
 
     phonemes_vocab_size: int
@@ -124,8 +125,8 @@ class _LinguisticAwareEncoder(nn.Module):
 
         return output[torch.arange(bsize).unsqueeze(1), phoneme_to_spec_indices]
 
-@dataclasses.dataclass
-class ReferenceEncoderCfg:
+
+class ReferenceEncoderCfg(pydantic.BaseModel):
     """Configuration for Reference Encoder"""
 
     d_model: int
@@ -237,8 +238,7 @@ class _ReferenceEncoder(nn.Module):
             L = (L - kernel_size + 2 * pad) // stride + 1
         return L
 
-@dataclasses.dataclass
-class STLConfig:
+class STLConfig(pydantic.BaseModel):
     """Configuration for Style Token Layer"""
 
     d_model: int
@@ -402,14 +402,18 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
         Speech Synthesis" by Yuxuan Wang et al.
     """
 
-    def __init__(self,
-                 ref_encoder_cfg: ReferenceEncoderCfg,
-                 stl_cfg: STLConfig,
-                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
-        
-        super().__init__(ref_encoder_cfg, ling_aware_cfg)
+    class Configuration(pydantic.BaseModel):
+        """Configuration for utterance-level prosody encoder."""
 
-        self._stl = _STL(stl_cfg)
+        ref_encoder_cfg: ReferenceEncoderCfg
+        stl_cfg: STLConfig
+        ling_aware_cfg: Optional[LingAwareEncoderCfg]
+
+    def __init__(self, cfg: Configuration):
+        
+        super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
+
+        self._stl = _STL(cfg.stl_cfg)
         
         
     def forward(self,
@@ -452,14 +456,18 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
         Models for Speech Synthesis" by Zhaoci Liu et al.
     """
 
-    def __init__(self,
-                 ref_encoder_cfg: ReferenceEncoderCfg,
-                 stl_cfg: STLConfig,
-                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
-        
-        super().__init__(ref_encoder_cfg, ling_aware_cfg)
+    class Configuration(pydantic.BaseModel):
+        """Configuration for word-level prosody encoder."""
 
-        self._stl = _STL(stl_cfg)
+        ref_encoder_cfg: ReferenceEncoderCfg
+        stl_cfg: STLConfig
+        ling_aware_cfg: Optional[LingAwareEncoderCfg]
+
+    def __init__(self, cfg: Configuration):
+        
+        super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
+
+        self._stl = _STL(cfg.stl_cfg)
 
     def forward(self,
                 spectrogram: torch.Tensor,
@@ -501,16 +509,20 @@ class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
     The module uses a single encoder for both levels of prosody embeddings.
     """
 
-    def __init__(self,
-                 ref_encoder_cfg: ReferenceEncoderCfg,
-                 global_stl_cfg: STLConfig,
-                 local_stl_cfg: STLConfig,
-                 ling_aware_cfg: Optional[LingAwareEncoderCfg]):
-        
-        super().__init__(ref_encoder_cfg, ling_aware_cfg)
+    class Configuration(pydantic.BaseModel):
+        """Configuration for hierarchical prosody encoder."""
 
-        self._global_stl = _STL(global_stl_cfg)
-        self._local_stl = _STL(local_stl_cfg)
+        ref_encoder_cfg: ReferenceEncoderCfg
+        global_stl_cfg: STLConfig
+        local_stl_cfg: STLConfig
+        ling_aware_cfg: Optional[LingAwareEncoderCfg]
+
+    def __init__(self, cfg: Configuration):
+        
+        super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
+
+        self._global_stl = _STL(cfg.global_stl_cfg)
+        self._local_stl = _STL(cfg.local_stl_cfg)
 
     def forward(self,
                 spectrogram: torch.Tensor,
@@ -569,34 +581,38 @@ class VarianceAdaptor(nn.Module):
         - Explicit utterance-level prosody modelling (pitch and energy quantized into bins).
     """
 
-    def __init__(self,
-                 d_model: int,
-                 multi_speaker: bool,
-                 use_utterance_level_prosody: bool,
-                 predictor_n_layers: int,
-                 predictor_n_int_channels: int,
-                 predictor_kernel_size: int,
-                 dropout_rate: float,
-                 spk_emb_dim: int):
+    class Configuration(pydantic.BaseModel):
+        """Configuration for variance adaptor."""
+
+        d_model: int
+        multi_speaker: bool
+        use_utterance_level_prosody: bool
+        predictor_n_layers: int
+        predictor_n_int_channels: int
+        predictor_kernel_size: int
+        dropout_rate: float
+        spk_emb_dim: int
+
+    def __init__(self, cfg: Configuration):
         
         super().__init__()
 
-        self._multi_speaker = multi_speaker
-        self._use_utterance_level_prosody = use_utterance_level_prosody
+        self._multi_speaker = cfg.multi_speaker
+        self._use_utterance_level_prosody = cfg.use_utterance_level_prosody
 
         self.length_regulator = LengthRegulator()
 
         self.duration_predictor = ProsodicFeaturesPredictor(
-                d_model,
-                n_chans=predictor_n_int_channels,
-                n_layers=predictor_n_layers,
-                dropout_rate=dropout_rate,
-                kernel_size=predictor_kernel_size)
+                d_model=cfg.d_model,
+                n_chans=cfg.predictor_n_int_channels,
+                n_layers=cfg.predictor_n_layers,
+                dropout_rate=cfg.dropout_rate,
+                kernel_size=cfg.predictor_kernel_size)
         
         self._spk_emb_enc = None
 
         if self._multi_speaker:
-            self._spk_emb_enc = nn.Linear(spk_emb_dim, d_model)
+            self._spk_emb_enc = nn.Linear(cfg.spk_emb_dim, cfg.d_model)
 
         self._pitch_transform = None
         self._pitch_predictor = None
@@ -607,41 +623,41 @@ class VarianceAdaptor(nn.Module):
 
             self._pitch_transform = nn.Sequential(
                 torch.nn.Conv1d(in_channels=1,
-                                out_channels=d_model,
+                                out_channels=cfg.d_model,
                                 kernel_size=3,
                                 padding='same'),
                 nn.ReLU(),
-                torch.nn.Conv1d(in_channels=d_model,
-                                out_channels=d_model,
+                torch.nn.Conv1d(in_channels=cfg.d_model,
+                                out_channels=cfg.d_model,
                                 kernel_size=3,
                                 padding='same'),
                 )
 
             self._pitch_predictor = ProsodicFeaturesPredictor(
-                idim=d_model,
-                n_layers=predictor_n_layers,
-                n_chans=predictor_n_int_channels,
-                kernel_size=predictor_kernel_size,
-                dropout_rate=dropout_rate)
+                idim=cfg.d_model,
+                n_layers=cfg.predictor_n_layers,
+                n_chans=cfg.predictor_n_int_channels,
+                kernel_size=cfg.predictor_kernel_size,
+                dropout_rate=cfg.dropout_rate)
             
             self._energy_transform = nn.Sequential(
                 torch.nn.Conv1d(in_channels=1,
-                                out_channels=d_model,
+                                out_channels=cfg.d_model,
                                 kernel_size=3,
                                 padding='same'),
                 nn.ReLU(),
-                torch.nn.Conv1d(in_channels=d_model,
-                                out_channels=d_model,
+                torch.nn.Conv1d(in_channels=cfg.d_model,
+                                out_channels=cfg.d_model,
                                 kernel_size=3,
                                 padding='same'),
                 )
 
             self.energy_predictor = ProsodicFeaturesPredictor(
-                idim=d_model,
-                n_layers=predictor_n_layers,
-                n_chans=predictor_n_int_channels,
-                kernel_size=predictor_kernel_size,
-                dropout_rate=dropout_rate)
+                idim=cfg.d_model,
+                n_layers=cfg.predictor_n_layers,
+                n_chans=cfg.predictor_n_int_channels,
+                kernel_size=cfg.predictor_kernel_size,
+                dropout_rate=cfg.dropout_rate)
 
     def forward(
         self,
