@@ -593,6 +593,28 @@ class VarianceAdaptor(nn.Module):
         dropout_rate: float
         spk_emb_dim: int
 
+    @dataclasses.dataclass
+    class ForwardInput:
+        """Input for forward pass of variance adaptor."""
+
+        # Phoneme representations (B, Tp, d_model)
+        phoneme_repr: torch.Tensor
+        # Lengths of the phoneme sequences (B,)
+        phonemes_length: torch.Tensor
+
+        # Only if using prosody quantization in modelling
+        pitch_possible_values: Optional[torch.Tensor]
+        energy_possible_values: Optional[torch.Tensor]
+        # Prosody modelling (training)
+        pitch_target: Optional[torch.Tensor]
+        energy_target: Optional[torch.Tensor]
+
+        # Only if multi-speaker
+        speaker_embedding: Optional[torch.Tensor]
+
+        # Alignment learning (training) (B, Tp)
+        explicit_durations: Optional[torch.Tensor]
+
     def __init__(self, cfg: Configuration):
         
         super().__init__()
@@ -659,62 +681,19 @@ class VarianceAdaptor(nn.Module):
                 kernel_size=cfg.predictor_kernel_size,
                 dropout_rate=cfg.dropout_rate)
 
-    def forward(
-        self,
-        phoneme_repr: torch.Tensor,
-        phonemes_length: torch.Tensor,
-
-        # Only if using utterance-level prosody
-        pitch_possible_values: Optional[torch.Tensor],
-        energy_possible_values: Optional[torch.Tensor],
-        # (training)
-        pitch_target: Optional[torch.Tensor],
-        energy_target: Optional[torch.Tensor],
-
-        # Only if multi-speaker
-        speaker_embedding: Optional[torch.Tensor],
-
-        # (training)
-        explicit_durations: Optional[torch.Tensor]):
+    def forward(self, inputs: ForwardInput):
         
+        inference_mode = self._validate_inputs_and_infer_mode(inputs)
+
         model_output = {}
-
-        if not self._multi_speaker:
-            assert speaker_embedding is None
-
-        else:
-            assert speaker_embedding is not None
-
-        train_only_inputs = [explicit_durations]
-
-        if self._use_prosody_modelling not in ('utterance', 'phoneme'):
-            assert all(el is None for el in (
-                pitch_possible_values,
-                energy_possible_values,
-                pitch_target,
-                energy_target,
-            ))
-
-        else:
-            train_only_inputs.extend([pitch_target, energy_target])
-        
-        if any(el is None for el in train_only_inputs):
-            inference_mode = True
-            assert all(el is None for el in train_only_inputs)    
-        
-        else:
-            inference_mode = False
-            assert all(el is not None for el in train_only_inputs)
-
-        outputs = phoneme_repr
+        outputs = inputs.phoneme_repr
 
         if self._multi_speaker:
-            assert speaker_embedding is not None
 
-            spk_emb_encoded = self._spk_emb_enc(speaker_embedding)
+            spk_emb_encoded = self._spk_emb_enc(inputs.speaker_embedding)
 
             outputs = outputs + spk_emb_encoded.unsqueeze(1).expand(
-                -1, phoneme_repr.shape[1], -1
+                -1, outputs.shape[1], -1
             )
         
         if self._use_prosody_modelling == 'phoneme':
@@ -723,24 +702,21 @@ class VarianceAdaptor(nn.Module):
                 outputs,
                 model_output,
                 inference_mode,
-                pitch_possible_values,
-                energy_possible_values,
-                pitch_target,
-                energy_target
+                inputs
             )
 
             outputs = outputs + pitch_enc + energy_enc
 
         predicted_durations = self.duration_predictor(outputs.detach())
         predicted_durations = torch.clamp(torch.round(predicted_durations), min=1)
-        predicted_durations = (predicted_durations * mask_from_lengths(phonemes_length))
+        predicted_durations = (predicted_durations * mask_from_lengths(inputs.phonemes_length))
 
         model_output['predicted_durations'] = predicted_durations
 
         if not inference_mode:
-            mel_lengths = explicit_durations.sum(dim=1).long()
+            mel_lengths = inputs.explicit_durations.sum(dim=1).long()
             outputs, _ = self.length_regulator(outputs,
-                                               explicit_durations,
+                                               inputs.explicit_durations,
                                                mel_lengths.max())
 
         else:
@@ -751,30 +727,53 @@ class VarianceAdaptor(nn.Module):
 
         if self._use_prosody_modelling == 'utterance':
 
-            pitch_enc, energy_enc = self._perform_prosody_modelling(
-                outputs,
+            pitch_enc, energy_enc = self._perform_prosody_modelling(outputs,
                 model_output,
                 inference_mode,
-                pitch_possible_values,
-                energy_possible_values,
-                pitch_target,
-                energy_target
-            )
+                inputs)
 
             outputs = outputs + pitch_enc + energy_enc
 
         model_output['output'] = outputs
 
         return model_output
+    
+    def _validate_inputs_and_infer_mode(self, inputs: ForwardInput):
+
+        if not self._multi_speaker:
+            assert inputs.speaker_embedding is None
+
+        else:
+            assert inputs.speaker_embedding is not None
+
+        train_only_inputs = [inputs.explicit_durations]
+
+        if self._use_prosody_modelling not in ('utterance', 'phoneme'):
+            assert all(el is None for el in (
+                inputs.pitch_possible_values,
+                inputs.energy_possible_values,
+                inputs.pitch_target,
+                inputs.energy_target,
+            ))
+
+        else:
+            train_only_inputs.extend([inputs.pitch_target, inputs.energy_target])
+        
+        if any(el is None for el in train_only_inputs):
+            inference_mode = True
+            assert all(el is None for el in train_only_inputs)    
+        
+        else:
+            inference_mode = False
+            assert all(el is not None for el in train_only_inputs)
+
+        return inference_mode
 
     def _perform_prosody_modelling(self,
                                    outputs: torch.Tensor,
                                    model_output: dict[str, torch.Tensor],
                                    inference_mode: bool,
-                                   pitch_possible_values: Optional[torch.Tensor],
-                                   energy_possible_values: Optional[torch.Tensor],
-                                   pitch_target: Optional[torch.Tensor],
-                                   energy_target: Optional[torch.Tensor]):
+                                   inputs: ForwardInput):
         
         predicted_pitch = self._pitch_predictor(outputs.detach())
         predicted_energy = self.energy_predictor(outputs.detach())
@@ -783,23 +782,23 @@ class VarianceAdaptor(nn.Module):
         model_output['predicted_energy'] = predicted_energy
 
         if not inference_mode:
-            chosen_energy = energy_target
-            chosen_pitch = pitch_target
+            chosen_energy = inputs.energy_target
+            chosen_pitch = inputs.pitch_target
 
         else:
             chosen_energy = predicted_energy
             chosen_pitch = predicted_pitch
 
-        if energy_possible_values is not None:
-            energy_indices = torch.bucketize(chosen_energy, energy_possible_values)
-            chosen_energy = energy_possible_values[energy_indices - 1]
+        if inputs.energy_possible_values is not None:
+            energy_indices = torch.bucketize(chosen_energy, inputs.energy_possible_values)
+            chosen_energy = inputs.energy_possible_values[energy_indices - 1]
 
         if not inference_mode:
             model_output['target_energy'] = chosen_energy
 
-        if pitch_possible_values is not None:
-            pitch_indices = torch.bucketize(chosen_pitch, pitch_possible_values)
-            chosen_pitch = pitch_possible_values[pitch_indices - 1]
+        if inputs.pitch_possible_values is not None:
+            pitch_indices = torch.bucketize(chosen_pitch, inputs.pitch_possible_values)
+            chosen_pitch = inputs.pitch_possible_values[pitch_indices - 1]
 
         if not inference_mode:
             model_output['target_pitch'] = chosen_pitch
