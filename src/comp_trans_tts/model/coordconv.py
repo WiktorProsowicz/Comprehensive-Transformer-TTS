@@ -23,7 +23,7 @@ class AddCoords(nn.Module):
             xx_channel = xx_channel * 2 - 1
             xx_channel = xx_channel.repeat(batch_size_shape, 1, 1)
 
-            if torch.cuda.is_available:
+            if torch.cuda.is_available():
                 input_tensor = input_tensor.cuda()
                 xx_channel = xx_channel.cuda()
             out = torch.cat([input_tensor, xx_channel], dim=1)
@@ -57,7 +57,7 @@ class AddCoords(nn.Module):
             xx_channel = xx_channel.repeat(batch_size_shape, 1, 1, 1)
             yy_channel = yy_channel.repeat(batch_size_shape, 1, 1, 1)
 
-            if torch.cuda.is_available:
+            if torch.cuda.is_available():
                 input_tensor = input_tensor.cuda()
                 xx_channel = xx_channel.cuda()
                 yy_channel = yy_channel.cuda()
@@ -97,7 +97,7 @@ class AddCoords(nn.Module):
             zx_channel = zx_channel.permute(0, 1, 4, 2, 3)
             zz_channel = torch.cat([zx_channel + i for i in range(dim_y)], dim=3)
 
-            if torch.cuda.is_available:
+            if torch.cuda.is_available():
                 input_tensor = input_tensor.cuda()
                 xx_channel = xx_channel.cuda()
                 yy_channel = yy_channel.cuda()
