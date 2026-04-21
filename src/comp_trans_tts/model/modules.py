@@ -708,10 +708,11 @@ class VarianceAdaptor(nn.Module):
             outputs = outputs + pitch_enc + energy_enc
 
         predicted_durations = self.duration_predictor(outputs.detach())
-        predicted_durations = torch.clamp(torch.round(predicted_durations), min=1)
-        predicted_durations = (predicted_durations * mask_from_lengths(inputs.phonemes_length))
+        durations_rounded = torch.clamp(torch.round(predicted_durations), min=1.0)
+        durations_rounded = (durations_rounded * mask_from_lengths(inputs.phonemes_length)).long()
 
         model_output['predicted_durations'] = predicted_durations
+        model_output['durations_rounded'] = durations_rounded
 
         if not inference_mode:
             mel_lengths = inputs.explicit_durations.sum(dim=1).long()
@@ -720,9 +721,9 @@ class VarianceAdaptor(nn.Module):
                                                mel_lengths.max())
 
         else:
-            mel_lengths = predicted_durations.sum(dim=1).long()
+            mel_lengths = durations_rounded.sum(dim=1)
             outputs, _ = self.length_regulator(outputs,
-                                               predicted_durations.long(),
+                                               durations_rounded,
                                                max_len=mel_lengths.max())
 
         if self._use_prosody_modelling == 'utterance':
