@@ -251,7 +251,7 @@ class StlBinarizationParams:
     hard: bool
     temperature: float
 
-class _STL(nn.Module):
+class STL(nn.Module):
     """ Style Token Layer """
 
     def __init__(self,
@@ -287,6 +287,22 @@ class _STL(nn.Module):
         embedding, embedding_weights = self.attention(query, keys_soft, binarization_params)
 
         return embedding, embedding_weights
+    
+    def get_emb_from_weights(self, weights: torch.Tensor) -> torch.Tensor:
+        
+        keys_soft = torch.tanh(self.embed)
+
+        if weights.ndim == 3:
+            keys_soft = keys_soft.unsqueeze(0).unsqueeze(0)
+            keys_soft = keys_soft.expand(weights.size(0), weights.size(1), -1, -1)
+
+        else:
+            keys_soft = keys_soft.unsqueeze(0)
+            keys_soft = keys_soft.expand(weights.size(0), -1, -1)
+
+        return self.attention.get_emb_from_weights(
+            keys_soft, weights
+        )
 
 def binarized_softmax(logits: torch.Tensor, tau: float=1.0, hard: bool=False, dim: int=-1):
 
@@ -345,6 +361,10 @@ class _StyleEmbedAttention(nn.Module):
         out_soft = torch.matmul(weights, values)
 
         return out_soft.squeeze(-2), weights.squeeze(-2)
+    
+    def get_emb_from_weights(self, key_soft: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        values = self.W_value(key_soft)
+        return torch.matmul(weights, values)
 
 class _ProsodyEncoderBase(nn.Module):
     """Encodes reference mel-spectrogram into style embeddings."""
@@ -413,7 +433,7 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
         
         super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
 
-        self._stl = _STL(cfg.stl_cfg)
+        self.stl = STL(cfg.stl_cfg)
         
         
     def forward(self,
@@ -446,7 +466,7 @@ class UtteranceLevelProsodyEncoder(_ProsodyEncoderBase):
                                                             linguistic_features,
                                                             phoneme_spec_indices)
 
-        return self._stl(global_ref_embedding, stl_binarization_params)
+        return self.stl(global_ref_embedding, stl_binarization_params)
 
 class WordLevelProsodyEncoder(_ProsodyEncoderBase):
     """Encodes reference mel-spectrogram into word-level prosody embeddings.
@@ -467,7 +487,7 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
         
         super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
 
-        self._stl = _STL(cfg.stl_cfg)
+        self.stl = STL(cfg.stl_cfg)
 
     def forward(self,
                 spectrogram: torch.Tensor,
@@ -501,7 +521,7 @@ class WordLevelProsodyEncoder(_ProsodyEncoderBase):
         word_level_embeddings = torch.bmm(spec_word_pool_matrix.transpose(-1, -2),
                                             local_ref_embeddings)
         
-        return self._stl(word_level_embeddings, stl_binarization_params)
+        return self.stl(word_level_embeddings, stl_binarization_params)
     
 class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
     """Encodes input spectrogram into both utterance-level and word-level prosody embeddings.
@@ -521,8 +541,8 @@ class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
         
         super().__init__(cfg.ref_encoder_cfg, cfg.ling_aware_cfg)
 
-        self._global_stl = _STL(cfg.global_stl_cfg)
-        self._local_stl = _STL(cfg.local_stl_cfg)
+        self.global_stl = STL(cfg.global_stl_cfg)
+        self.local_stl = STL(cfg.local_stl_cfg)
 
     def forward(self,
                 spectrogram: torch.Tensor,
@@ -556,8 +576,8 @@ class HierarchicalProsodyEncoder(_ProsodyEncoderBase):
         word_level_embeddings = torch.bmm(spec_word_pool_matrix.transpose(-1, -2),
                                             local_ref_embeddings)
 
-        return (self._global_stl(global_ref_embedding, global_stl_binarization_params),
-                self._local_stl(word_level_embeddings, local_stl_binarization_params))
+        return (self.global_stl(global_ref_embedding, global_stl_binarization_params),
+                self.local_stl(word_level_embeddings, local_stl_binarization_params))
 
 @torch.no_grad()
 def mask_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
