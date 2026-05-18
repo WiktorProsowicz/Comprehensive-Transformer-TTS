@@ -364,7 +364,7 @@ class _StyleEmbedAttention(nn.Module):
     
     def get_emb_from_weights(self, key_soft: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         values = self.W_value(key_soft)
-        return torch.matmul(weights, values)
+        return torch.matmul(weights.unsqueeze(-2), values).squeeze(-2)
 
 class _ProsodyEncoderBase(nn.Module):
     """Encodes reference mel-spectrogram into style embeddings."""
